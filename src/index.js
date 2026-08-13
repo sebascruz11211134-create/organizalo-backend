@@ -20,6 +20,7 @@ const eventosRouter   = require("./routes/eventos");
 const crmRouter       = require("./routes/crm");
 const whatsappRouter  = require("./routes/whatsapp");
 const { enviarRecordatoriosHoy } = require("./routes/whatsapp");
+const ntfy = require("./services/ntfy");
 const asistenteRouter   = require("./routes/asistente");
 const rockyRouter       = require("./routes/rocky");
 const ntfyRouter        = require("./routes/ntfy");
@@ -123,13 +124,113 @@ app.use((req, res) => {
   res.status(404).json({ error: "Ruta no encontrada." });
 });
 
-// ── Cron: recordatorios WhatsApp a las 8am ────────────────────────────────────
+// ── Cron: recordatorios diarios a las 8am ────────────────────────────────────
 setInterval(() => {
   const now = new Date();
   if (now.getHours() === 8 && now.getMinutes() < 5) {
     enviarRecordatoriosHoy().catch(console.error);
+    verificarVencimientos().catch(console.error);
   }
 }, 5 * 60 * 1000);
+
+/**
+ * Revisa cloud_data de todas las empresas y envía ntfy para:
+ *  - CxC que vence hoy o en 3 días → notificación de cobro
+ *  - CxP que vence hoy o en 3 días → notificación de pago
+ *  - Eventos del calendario del día siguiente → recordatorio
+ */
+async function verificarVencimientos() {
+  const hoy    = new Date().toISOString().slice(0, 10);
+  const en3    = new Date(Date.now() + 3 * 86400_000).toISOString().slice(0, 10);
+
+  try {
+    // Obtener todas las empresas activas
+    const empresas = db.prepare(
+      "SELECT DISTINCT empresa_id, empresa_nombre FROM users WHERE empresa_id IS NOT NULL AND activo = 1"
+    ).all();
+
+    for (const emp of empresas) {
+      const { empresa_id: empresaId, empresa_nombre: empresaNombre } = emp;
+
+      // ── CxC venciendo ──────────────────────────────────────────────────────
+      const cxcRow = db.prepare(
+        "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'deudas'"
+      ).get(empresaId);
+      if (cxcRow?.valor) {
+        let deudas = [];
+        try { deudas = JSON.parse(cxcRow.valor); } catch {}
+
+        const cxcVenciendo = deudas.filter(d =>
+          d.tipo === "cobrar" &&
+          d.fechaVencimiento &&
+          d.fechaVencimiento >= hoy && d.fechaVencimiento <= en3 &&
+          Math.max(0, (d.total || 0) - (d.pagado || 0)) > 1
+        );
+
+        for (const d of cxcVenciendo) {
+          const saldo = d.total - (d.pagado || 0);
+          const esHoy = d.fechaVencimiento === hoy;
+          await ntfy.notifyByPrefs({
+            tipo:      "cobro_vencido",
+            empresaId,
+            title:     esHoy ? `💰 Cobro VENCE HOY: ${d.nombre}` : `⏰ Cobro próximo: ${d.nombre}`,
+            message:   `₡${saldo.toLocaleString("es-CR", {minimumFractionDigits:0})} — vence el ${d.fechaVencimiento}${d.facturaRef ? ` (${d.facturaRef})` : ""}`,
+            priority:  esHoy ? 5 : 3,
+          }, db);
+        }
+      }
+
+      // ── CxP venciendo ──────────────────────────────────────────────────────
+      const cxpVenciendo = cxcRow?.valor ? [] : [];
+      // Las CxP también están en cloud_data['deudas'] con tipo='pagar'
+      if (cxcRow?.valor) {
+        let deudas = [];
+        try { deudas = JSON.parse(cxcRow.valor); } catch {}
+        const venciendo = deudas.filter(d =>
+          d.tipo === "pagar" &&
+          d.fechaVencimiento &&
+          d.fechaVencimiento >= hoy && d.fechaVencimiento <= en3 &&
+          Math.max(0, (d.total || 0) - (d.pagado || 0)) > 1
+        );
+        for (const d of venciendo) {
+          const saldo = d.total - (d.pagado || 0);
+          const esHoy = d.fechaVencimiento === hoy;
+          await ntfy.notifyByPrefs({
+            tipo:      "cobro_vencido",
+            empresaId,
+            title:     esHoy ? `🏦 Pago VENCE HOY: ${d.nombre}` : `⏰ Pago próximo: ${d.nombre}`,
+            message:   `₡${saldo.toLocaleString("es-CR", {minimumFractionDigits:0})} — vence el ${d.fechaVencimiento}${d.facturaRef ? ` (${d.facturaRef})` : ""}`,
+            priority:  esHoy ? 5 : 3,
+          }, db);
+        }
+      }
+
+      // ── Eventos del calendario mañana ──────────────────────────────────────
+      try {
+        const { getEmpresaDb } = require("./db");
+        const edb = getEmpresaDb(empresaId);
+        const manana = new Date(Date.now() + 86400_000).toISOString().slice(0, 10);
+        const eventos = edb.prepare(
+          "SELECT * FROM eventos WHERE fecha = ? ORDER BY hora"
+        ).all(manana);
+
+        for (const ev of eventos) {
+          await ntfy.notifyByPrefs({
+            tipo:      "recordatorio_evento",
+            empresaId,
+            title:     `📅 Mañana: ${ev.titulo}`,
+            message:   `${ev.hora ? ev.hora.slice(0,5) + " — " : ""}${ev.descripcion || ""}`,
+            priority:  3,
+          }, db);
+        }
+      } catch {}
+    }
+
+    console.log(`[cron] Vencimientos verificados para ${empresas.length} empresas`);
+  } catch (err) {
+    console.error("[cron/vencimientos]", err.message);
+  }
+}
 
 // ── Servidor ──────────────────────────────────────────────────────────────────
 server.listen(config.port, () => {
