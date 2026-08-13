@@ -16,6 +16,20 @@ const config   = require("../config");
 
 const router = express.Router();
 
+// El superadmin puede registrarse sin código de acceso
+const SUPERADMIN_EMAIL = "sebascruz11211134@gmail.com";
+
+// ── Validación de contraseña fuerte ──────────────────────────────────────────
+function validatePasswordStrength(password) {
+  const fails = [];
+  if (!password || password.length < 8)    fails.push("Mínimo 8 caracteres");
+  if (!/[A-Z]/.test(password))             fails.push("Al menos una mayúscula (A-Z)");
+  if (!/[a-z]/.test(password))             fails.push("Al menos una minúscula (a-z)");
+  if (!/[0-9]/.test(password))             fails.push("Al menos un número (0-9)");
+  if (!/[^A-Za-z0-9]/.test(password))      fails.push("Al menos un carácter especial (!@#$%...)");
+  return fails; // array vacío = contraseña válida
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function jwtSecret() {
@@ -88,57 +102,74 @@ router.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Nombre requerido (mínimo 2 caracteres)." });
     if (!email || !email.includes("@"))
       return res.status(400).json({ error: "Correo electrónico inválido." });
-    if (!password || password.length < 6)
-      return res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres." });
-    if (!codigoAcceso || typeof codigoAcceso !== "string")
-      return res.status(400).json({ error: "Se requiere un código de acceso. Contactá a Organízalo.AI para obtener el tuyo." });
 
-    // Validar código de acceso
-    const codigo = db.prepare(
-      "SELECT * FROM access_codes WHERE codigo = ? COLLATE NOCASE"
-    ).get(codigoAcceso.trim().toUpperCase());
+    const pwdErrors = validatePasswordStrength(password);
+    if (pwdErrors.length > 0)
+      return res.status(400).json({ error: `Contraseña insegura: ${pwdErrors.join(", ")}.` });
 
-    if (!codigo)
-      return res.status(403).json({ error: "Código de acceso inválido. Verificá que esté bien escrito." });
-    if (codigo.usos_actuales >= codigo.max_usos)
-      return res.status(403).json({ error: `Este código ya alcanzó el límite de ${codigo.max_usos} usuario${codigo.max_usos !== 1 ? "s" : ""}. Solicitá un nuevo código.` });
-    if (codigo.expira_en && new Date(codigo.expira_en) < new Date())
-      return res.status(403).json({ error: "Este código de acceso venció. Solicitá uno nuevo." });
-    if (codigo.email_esperado && codigo.email_esperado.toLowerCase() !== email.trim().toLowerCase())
-      return res.status(403).json({ error: "Este código fue generado para otro correo electrónico." });
+    const emailNorm   = email.trim().toLowerCase();
+    const esSuperAdmin = emailNorm === SUPERADMIN_EMAIL;
 
-    const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email.trim().toLowerCase());
+    let empresaId, empresaNom, rol, planUser, trialEndsUser;
+
+    if (esSuperAdmin) {
+      // Superadmin: no necesita código de acceso, plan activo permanente
+      empresaId     = "superadmin";
+      empresaNom    = "Organízalo.AI — Admin";
+      rol           = "superadmin";
+      planUser      = "activo";
+      trialEndsUser = null;
+    } else {
+      // Usuario normal: requiere código de acceso válido
+      if (!codigoAcceso || typeof codigoAcceso !== "string")
+        return res.status(400).json({ error: "Se requiere un código de acceso. Contactá a Organízalo.AI para obtener el tuyo." });
+
+      const codigo = db.prepare(
+        "SELECT * FROM access_codes WHERE codigo = ? COLLATE NOCASE"
+      ).get(codigoAcceso.trim().toUpperCase());
+
+      if (!codigo)
+        return res.status(403).json({ error: "Código de acceso inválido. Verificá que esté bien escrito." });
+      if (codigo.usos_actuales >= codigo.max_usos)
+        return res.status(403).json({ error: `Este código ya alcanzó el límite de ${codigo.max_usos} usuario${codigo.max_usos !== 1 ? "s" : ""}. Solicitá un nuevo código.` });
+      if (codigo.expira_en && new Date(codigo.expira_en) < new Date())
+        return res.status(403).json({ error: "Este código de acceso venció. Solicitá uno nuevo." });
+      if (codigo.email_esperado && codigo.email_esperado.toLowerCase() !== emailNorm)
+        return res.status(403).json({ error: "Este código fue generado para otro correo electrónico." });
+
+      const esPrimero = codigo.usos_actuales === 0;
+      empresaId  = esPrimero ? uuidv4() : codigo.empresa_id;
+      empresaNom = esPrimero ? nombre.trim() : (codigo.empresa_nombre || nombre.trim());
+      rol        = esPrimero ? "admin" : "colaborador";
+      planUser      = "trial";
+      trialEndsUser = new Date(Date.now() + 7 * 86400_000).toISOString();
+
+      // Actualizar contador del código
+      if (esPrimero) {
+        db.prepare(
+          "UPDATE access_codes SET usos_actuales = usos_actuales + 1, empresa_id = ?, empresa_nombre = ? WHERE id = ?"
+        ).run(empresaId, nombre.trim(), codigo.id);
+      } else {
+        db.prepare(
+          "UPDATE access_codes SET usos_actuales = usos_actuales + 1 WHERE id = ?"
+        ).run(codigo.id);
+      }
+    }
+
+    const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(emailNorm);
     if (existing) return res.status(409).json({ error: "Ya existe una cuenta con ese correo." });
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const now         = new Date().toISOString();
-    const trialEnds   = new Date(Date.now() + 7 * 86400_000).toISOString();
-    const id          = uuidv4();
-
-    // Si es el primer usuario del código, crea empresa nueva. Los demás se unen a la misma.
-    const esPrimero  = codigo.usos_actuales === 0;
-    const empresaId  = esPrimero ? uuidv4() : codigo.empresa_id;
-    const empresaNom = esPrimero ? nombre.trim() : (codigo.empresa_nombre || nombre.trim());
-    const rol        = esPrimero ? "admin" : "colaborador";
+    const now          = new Date().toISOString();
+    const id           = uuidv4();
 
     // Auto-generar username único a partir del nombre
     const username = generateUsername(nombre.trim(), email.trim(), id);
 
     db.prepare(`
       INSERT INTO users (id, nombre, email, password_hash, telefono, empresa_id, empresa_nombre, rol, plan, trial_ends, activo, username, creado_en, actualizado_en)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'trial', ?, 1, ?, ?, ?)
-    `).run(id, nombre.trim(), email.trim().toLowerCase(), passwordHash, telefono || null, empresaId, empresaNom, rol, trialEnds, username, now, now);
-
-    // Actualizar contador y guardar empresa_id si es el primero
-    if (esPrimero) {
-      db.prepare(
-        "UPDATE access_codes SET usos_actuales = usos_actuales + 1, empresa_id = ?, empresa_nombre = ? WHERE id = ?"
-      ).run(empresaId, nombre.trim(), codigo.id);
-    } else {
-      db.prepare(
-        "UPDATE access_codes SET usos_actuales = usos_actuales + 1 WHERE id = ?"
-      ).run(codigo.id);
-    }
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    `).run(id, nombre.trim(), emailNorm, passwordHash, telefono || null, empresaId, empresaNom, rol, planUser, trialEndsUser, username, now, now);
 
     const user  = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
     const token = signToken(user);
@@ -261,8 +292,11 @@ router.post("/accept-invite/:token", async (req, res) => {
     if (new Date(invite.expira_en) < new Date()) return res.status(410).json({ error: "La invitación expiró." });
 
     const { nombre, password } = req.body || {};
-    if (!nombre || !password || password.length < 6)
-      return res.status(400).json({ error: "Nombre y contraseña (mínimo 6 caracteres) requeridos." });
+    if (!nombre || !password)
+      return res.status(400).json({ error: "Nombre y contraseña requeridos." });
+    const pwdErrors2 = validatePasswordStrength(password);
+    if (pwdErrors2.length > 0)
+      return res.status(400).json({ error: `Contraseña insegura: ${pwdErrors2.join(", ")}.` });
 
     const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(invite.email);
     if (existing) return res.status(409).json({ error: "Ya existe una cuenta con ese correo." });
