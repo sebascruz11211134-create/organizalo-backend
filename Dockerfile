@@ -21,7 +21,7 @@ WORKDIR /app
 
 # Instalar dependencias primero (capa cacheada)
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # Copiar el código
 COPY . .
