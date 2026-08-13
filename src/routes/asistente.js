@@ -1,15 +1,16 @@
 /**
- * /api/asistente — Asistente IA por empresa con filtrado de datos por rol.
+ * /api/asistente — Agente IA con tool-calling por empresa.
  *
- * POST /api/asistente/chat
- *   Authorization: Bearer <jwt>
- *   Body: { messages: [{role, content}], pregunta?: string }
+ * El agente puede consultar los datos reales de la empresa en tiempo real
+ * usando "tools" (herramientas). Cada tool filtra por empresaId del JWT,
+ * garantizando aislamiento total entre clientes.
  *
- * El endpoint:
- *   1. Verifica el JWT y extrae empresaId + rol
- *   2. Carga de cloud_data solo las claves permitidas para ese rol
- *   3. Construye un system prompt con los datos resumidos de la empresa
- *   4. Llama a Anthropic y devuelve la respuesta
+ * Flujo:
+ *  1. Usuario hace pregunta
+ *  2. Claude decide qué tools necesita y las llama
+ *  3. Backend ejecuta las queries y devuelve resultados reales
+ *  4. Claude analiza y responde con datos exactos
+ *  (repite hasta máx MAX_ITERACIONES)
  */
 
 const express   = require("express");
@@ -20,9 +21,9 @@ const config    = require("../config");
 const { checkQuota, registerUsage } = require("../middleware/apiQuota");
 
 const router = express.Router();
+const MAX_ITERACIONES = 6; // máximo de rondas de tool-calling
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
-
+// ── Auth ──────────────────────────────────────────────────────────────────────
 function requireJWT(req, res, next) {
   const header = req.headers.authorization || "";
   const token  = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -35,51 +36,9 @@ function requireJWT(req, res, next) {
   }
 }
 
-// ── Permisos por rol → claves de cloud_data que puede ver ────────────────────
-//
-// null  = sin restricción (ve todo)
-// Array = solo esas claves
-
-const ROLE_CLAVES = {
-  admin:        null,
-  gerencia:     [
-    "facturas", "cotizaciones", "cxc", "cxp", "recibos",
-    "inventario", "productos_catalogo", "contactos", "pedidos",
-    "analytics", "flujo_caja",
-  ],
-  ventas:       [
-    "facturas", "cotizaciones", "contactos", "pedidos",
-    "cxc", "recibos", "pos_ventas", "productos_catalogo",
-  ],
-  contabilidad: [
-    "facturas", "compras", "cxc", "cxp", "recibos",
-    "asientos", "balances", "catalogo_cuentas", "d104",
-    "presupuesto", "conciliacion_bancaria", "notas_credito",
-  ],
-  bodega:       [
-    "inventario", "productos_catalogo", "compras",
-    "pedidos", "ordenes_trabajo",
-  ],
-  rrhh:         [
-    "empleados", "planillas", "flujo_caja",
-  ],
-  colaborador:  [
-    "facturas", "cotizaciones", "contactos", "pedidos",
-  ],
-};
-
-// ── Helpers de resumen — evitan mandar arrays enormes a Claude ───────────────
-
-function hace90dias() {
-  const d = new Date();
-  d.setDate(d.getDate() - 90);
-  return d.toISOString().slice(0, 10);
-}
-
-function hace30dias() {
-  const d = new Date();
-  d.setDate(d.getDate() - 30);
-  return d.toISOString().slice(0, 10);
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function parse(str) {
+  try { return JSON.parse(str); } catch { return null; }
 }
 
 function hoy() {
@@ -87,291 +46,544 @@ function hoy() {
 }
 
 function mesActual() {
-  return new Date().toISOString().slice(0, 7); // "2026-08"
+  return new Date().toISOString().slice(0, 7);
 }
 
 function fmtCRC(n) {
   return `₡${Number(n || 0).toLocaleString("es-CR", { minimumFractionDigits: 0 })}`;
 }
 
-/** Parsea JSON sin explotar */
-function parse(str) {
-  try { return JSON.parse(str); } catch { return null; }
+/** Carga un array de cloud_data para una empresa */
+function cargarDato(empresaId, clave) {
+  const row = db.prepare(
+    "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = ?"
+  ).get(empresaId, clave);
+  if (!row) return [];
+  const data = parse(row.valor);
+  return Array.isArray(data) ? data : (data ? [data] : []);
 }
 
-/**
- * Dado el objeto completo de cloud_data de la empresa,
- * genera un string de contexto compacto según el rol.
- */
-function buildContexto(datos, rol, empresaNombre) {
-  const secciones = [];
-  const hd = hace30dias();
-  const h90 = hace90dias();
+function cargarObjeto(empresaId, clave) {
+  const row = db.prepare(
+    "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = ?"
+  ).get(empresaId, clave);
+  return row ? (parse(row.valor) || {}) : {};
+}
 
-  // ── Empresa / settings ────────────────────────────────────────────────────
-  const settings = datos["settings"] || {};
-  secciones.push(
-    `EMPRESA: ${settings.nombreNegocio || empresaNombre || "Sin nombre"} | ` +
-    `Moneda: ${settings.moneda || "CRC"} | Fecha hoy: ${hoy()}`
-  );
+// ── Definición de herramientas ─────────────────────────────────────────────────
+const TOOLS = [
+  {
+    name: "buscar_facturas",
+    description: "Busca facturas emitidas de la empresa. Úsala para preguntas sobre ventas, ingresos, clientes que compraron, totales de facturación o facturas específicas.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cliente:    { type: "string",  description: "Filtrar por nombre o parte del nombre del cliente" },
+        fechaDesde: { type: "string",  description: "Fecha inicio YYYY-MM-DD" },
+        fechaHasta: { type: "string",  description: "Fecha fin YYYY-MM-DD" },
+        estado:     { type: "string",  description: "Estado: pagada | pendiente | anulada" },
+        limite:     { type: "integer", description: "Máximo de resultados (default 30)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "buscar_cxc",
+    description: "Consulta cuentas por cobrar (deudas de clientes). Úsala para preguntas sobre quién debe dinero, cobros pendientes, deudas vencidas o saldo de un cliente específico.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cliente:      { type: "string",  description: "Filtrar por nombre del cliente" },
+        soloVencidas: { type: "boolean", description: "true para traer solo las vencidas" },
+        limite:       { type: "integer", description: "Máximo de resultados (default 30)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "buscar_cxp",
+    description: "Consulta cuentas por pagar (deudas con proveedores). Úsala para preguntas sobre lo que se le debe a proveedores o pagos pendientes.",
+    input_schema: {
+      type: "object",
+      properties: {
+        proveedor:    { type: "string",  description: "Filtrar por nombre del proveedor" },
+        soloVencidas: { type: "boolean", description: "true para traer solo las vencidas" },
+        limite:       { type: "integer", description: "Máximo de resultados (default 30)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "buscar_inventario",
+    description: "Consulta el inventario de productos. Úsala para preguntas sobre stock, precios, productos bajo mínimo o existencias de un producto específico.",
+    input_schema: {
+      type: "object",
+      properties: {
+        producto:     { type: "string",  description: "Filtrar por nombre o parte del nombre del producto" },
+        soloStockBajo: { type: "boolean", description: "true para traer solo productos bajo el mínimo" },
+        sinStock:     { type: "boolean", description: "true para traer solo productos sin stock" },
+        limite:       { type: "integer", description: "Máximo de resultados (default 30)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "buscar_contactos",
+    description: "Busca clientes o proveedores registrados en el sistema. Úsala para encontrar datos de contacto, cédula, teléfono o información de clientes/proveedores.",
+    input_schema: {
+      type: "object",
+      properties: {
+        nombre: { type: "string", description: "Nombre o parte del nombre a buscar" },
+        tipo:   { type: "string", description: "cliente | proveedor | ambos (default: ambos)" },
+        limite: { type: "integer", description: "Máximo de resultados (default 20)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "buscar_pedidos",
+    description: "Consulta pedidos u órdenes de venta. Úsala para preguntas sobre el pipeline de ventas, pedidos en proceso o entregados.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cliente: { type: "string", description: "Filtrar por nombre del cliente" },
+        estado:  { type: "string", description: "pendiente | en_proceso | entregado | cancelado" },
+        limite:  { type: "integer", description: "Máximo de resultados (default 20)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "buscar_cotizaciones",
+    description: "Busca cotizaciones o presupuestos enviados a clientes. Úsala para preguntas sobre propuestas enviadas, tasa de conversión o cotizaciones abiertas.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cliente: { type: "string", description: "Filtrar por nombre del cliente" },
+        estado:  { type: "string", description: "borrador | enviada | aprobada | rechazada" },
+        limite:  { type: "integer", description: "Máximo de resultados (default 20)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "buscar_compras",
+    description: "Busca facturas de proveedores o compras realizadas. Úsala para preguntas sobre gastos, compras a proveedores o historial de adquisiciones.",
+    input_schema: {
+      type: "object",
+      properties: {
+        proveedor:  { type: "string", description: "Filtrar por nombre del proveedor" },
+        fechaDesde: { type: "string", description: "Fecha inicio YYYY-MM-DD" },
+        fechaHasta: { type: "string", description: "Fecha fin YYYY-MM-DD" },
+        limite:     { type: "integer", description: "Máximo de resultados (default 20)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "resumen_financiero",
+    description: "Genera un resumen financiero del período solicitado: facturación, cobros pendientes, gastos, top clientes. Úsala cuando el usuario pide un resumen general, indicadores del negocio o comparativas.",
+    input_schema: {
+      type: "object",
+      properties: {
+        periodo: {
+          type: "string",
+          description: "Período a analizar: hoy | semana | mes | trimestre | año (default: mes)",
+        },
+      },
+      required: [],
+    },
+  },
+];
 
-  // ── Facturas ──────────────────────────────────────────────────────────────
-  if (datos["facturas"]) {
-    const todas = datos["facturas"] || [];
-    const recientes = todas.filter(f => (f.fecha || "") >= h90);
-    const estesMes  = todas.filter(f => (f.fecha || "").startsWith(mesActual()));
-    const totalMes  = estesMes.reduce((s, f) => s + (f.total || 0), 0);
-    const totalQ    = recientes.reduce((s, f) => s + (f.total || 0), 0);
+// ── Implementación de herramientas ─────────────────────────────────────────────
+function ejecutarTool(nombre, input, empresaId) {
+  try {
+    switch (nombre) {
 
-    // Top 5 clientes por monto últimos 90 días
-    const porCliente = {};
-    recientes.forEach(f => {
-      const k = f.clienteNombre || f.cliente || "Sin nombre";
-      porCliente[k] = (porCliente[k] || 0) + (f.total || 0);
-    });
-    const topClientes = Object.entries(porCliente)
-      .sort((a, b) => b[1] - a[1]).slice(0, 5)
-      .map(([n, t]) => `${n}: ${fmtCRC(t)}`).join(", ");
+      case "buscar_facturas": {
+        let items = cargarDato(empresaId, "facturas");
+        const lim = input.limite || 30;
+        if (input.cliente)
+          items = items.filter(f => (f.clienteNombre || f.cliente || "").toLowerCase().includes(input.cliente.toLowerCase()));
+        if (input.fechaDesde)
+          items = items.filter(f => (f.fecha || "") >= input.fechaDesde);
+        if (input.fechaHasta)
+          items = items.filter(f => (f.fecha || "") <= input.fechaHasta);
+        if (input.estado)
+          items = items.filter(f => (f.estado || "").toLowerCase() === input.estado.toLowerCase());
+        items = items.sort((a, b) => (b.fecha || "").localeCompare(a.fecha || "")).slice(0, lim);
+        const total = items.reduce((s, f) => s + (f.total || 0), 0);
+        return {
+          total_resultados: items.length,
+          total_monto: fmtCRC(total),
+          facturas: items.map(f => ({
+            numero:   f.numero || f.id || "—",
+            fecha:    f.fecha || "—",
+            cliente:  f.clienteNombre || f.cliente || "—",
+            total:    fmtCRC(f.total),
+            estado:   f.estado || "—",
+            metodo:   f.metodoPago || "—",
+          })),
+        };
+      }
 
-    secciones.push(
-      `FACTURACIÓN:\n` +
-      `  Este mes (${mesActual()}): ${estesMes.length} facturas | Total: ${fmtCRC(totalMes)}\n` +
-      `  Últimos 90 días: ${recientes.length} facturas | Total: ${fmtCRC(totalQ)}\n` +
-      `  Top clientes (90d): ${topClientes || "N/D"}`
-    );
+      case "buscar_cxc": {
+        let items = cargarDato(empresaId, "cxc");
+        const lim = input.limite || 30;
+        // Solo pendientes (con saldo)
+        items = items.filter(d => Math.max(0, (d.total || 0) - (d.pagado || 0)) > 0);
+        if (input.cliente)
+          items = items.filter(d => (d.clienteNombre || d.cliente || "").toLowerCase().includes(input.cliente.toLowerCase()));
+        if (input.soloVencidas)
+          items = items.filter(d => d.fechaVencimiento && d.fechaVencimiento < hoy());
+        items = items.slice(0, lim);
+        const totalPendiente = items.reduce((s, d) => s + Math.max(0, (d.total || 0) - (d.pagado || 0)), 0);
+        return {
+          total_cuentas: items.length,
+          total_pendiente: fmtCRC(totalPendiente),
+          cuentas: items.map(d => ({
+            cliente:    d.clienteNombre || d.cliente || "—",
+            total:      fmtCRC(d.total),
+            pagado:     fmtCRC(d.pagado || 0),
+            pendiente:  fmtCRC(Math.max(0, (d.total || 0) - (d.pagado || 0))),
+            vencimiento: d.fechaVencimiento || "—",
+            vencida:    d.fechaVencimiento ? d.fechaVencimiento < hoy() : false,
+          })),
+        };
+      }
+
+      case "buscar_cxp": {
+        let items = cargarDato(empresaId, "cxp");
+        const lim = input.limite || 30;
+        items = items.filter(d => Math.max(0, (d.total || 0) - (d.pagado || 0)) > 0);
+        if (input.proveedor)
+          items = items.filter(d => (d.proveedorNombre || d.proveedor || "").toLowerCase().includes(input.proveedor.toLowerCase()));
+        if (input.soloVencidas)
+          items = items.filter(d => d.fechaVencimiento && d.fechaVencimiento < hoy());
+        items = items.slice(0, lim);
+        const totalPendiente = items.reduce((s, d) => s + Math.max(0, (d.total || 0) - (d.pagado || 0)), 0);
+        return {
+          total_cuentas: items.length,
+          total_pendiente: fmtCRC(totalPendiente),
+          cuentas: items.map(d => ({
+            proveedor:  d.proveedorNombre || d.proveedor || "—",
+            pendiente:  fmtCRC(Math.max(0, (d.total || 0) - (d.pagado || 0))),
+            vencimiento: d.fechaVencimiento || "—",
+            vencida:    d.fechaVencimiento ? d.fechaVencimiento < hoy() : false,
+          })),
+        };
+      }
+
+      case "buscar_inventario": {
+        let items = cargarDato(empresaId, "inventario");
+        const lim = input.limite || 30;
+        items = items.filter(p => p.activo !== false);
+        if (input.producto)
+          items = items.filter(p => (p.nombre || "").toLowerCase().includes(input.producto.toLowerCase()));
+        if (input.soloStockBajo)
+          items = items.filter(p => (p.stock || 0) <= (p.stockMin || 0) && (p.stock || 0) > 0);
+        if (input.sinStock)
+          items = items.filter(p => (p.stock || 0) === 0);
+        items = items.slice(0, lim);
+        return {
+          total_resultados: items.length,
+          productos: items.map(p => ({
+            nombre:    p.nombre || "—",
+            codigo:    p.codigo || p.codigoBarras || "—",
+            stock:     p.stock ?? 0,
+            stockMin:  p.stockMin ?? 0,
+            precio:    fmtCRC(p.precioVenta || p.precio || 0),
+            bodega:    p.bodega || "—",
+            bajo_minimo: (p.stock || 0) <= (p.stockMin || 0),
+          })),
+        };
+      }
+
+      case "buscar_contactos": {
+        let items = cargarDato(empresaId, "contactos");
+        const lim = input.limite || 20;
+        if (input.nombre)
+          items = items.filter(c => (c.nombre || "").toLowerCase().includes(input.nombre.toLowerCase()));
+        if (input.tipo && input.tipo !== "ambos")
+          items = items.filter(c => (c.tipo || "cliente") === input.tipo);
+        items = items.slice(0, lim);
+        return {
+          total_resultados: items.length,
+          contactos: items.map(c => ({
+            nombre:   c.nombre || "—",
+            tipo:     c.tipo || "cliente",
+            cedula:   c.cedula || "—",
+            telefono: c.telefono || "—",
+            email:    c.email || "—",
+            codigo:   c.codigoCliente || "—",
+          })),
+        };
+      }
+
+      case "buscar_pedidos": {
+        let items = cargarDato(empresaId, "pedidos");
+        const lim = input.limite || 20;
+        if (input.cliente)
+          items = items.filter(p => (p.clienteNombre || p.cliente || "").toLowerCase().includes(input.cliente.toLowerCase()));
+        if (input.estado)
+          items = items.filter(p => (p.estado || "").toLowerCase() === input.estado.toLowerCase());
+        items = items.sort((a, b) => (b.fecha || "").localeCompare(a.fecha || "")).slice(0, lim);
+        return {
+          total_resultados: items.length,
+          pedidos: items.map(p => ({
+            numero:  p.numero || p.id || "—",
+            cliente: p.clienteNombre || p.cliente || "—",
+            fecha:   p.fecha || "—",
+            estado:  p.estado || "—",
+            total:   fmtCRC(p.total || 0),
+          })),
+        };
+      }
+
+      case "buscar_cotizaciones": {
+        let items = cargarDato(empresaId, "cotizaciones");
+        const lim = input.limite || 20;
+        if (input.cliente)
+          items = items.filter(c => (c.clienteNombre || c.cliente || "").toLowerCase().includes(input.cliente.toLowerCase()));
+        if (input.estado)
+          items = items.filter(c => (c.estado || "").toLowerCase() === input.estado.toLowerCase());
+        items = items.sort((a, b) => (b.fecha || "").localeCompare(a.fecha || "")).slice(0, lim);
+        return {
+          total_resultados: items.length,
+          cotizaciones: items.map(c => ({
+            numero:  c.numero || c.id || "—",
+            cliente: c.clienteNombre || c.cliente || "—",
+            fecha:   c.fecha || "—",
+            estado:  c.estado || "borrador",
+            total:   fmtCRC(c.total || 0),
+          })),
+        };
+      }
+
+      case "buscar_compras": {
+        let items = cargarDato(empresaId, "compras");
+        const lim = input.limite || 20;
+        if (input.proveedor)
+          items = items.filter(c => (c.proveedorNombre || c.proveedor || "").toLowerCase().includes(input.proveedor.toLowerCase()));
+        if (input.fechaDesde)
+          items = items.filter(c => (c.fecha || "") >= input.fechaDesde);
+        if (input.fechaHasta)
+          items = items.filter(c => (c.fecha || "") <= input.fechaHasta);
+        items = items.sort((a, b) => (b.fecha || "").localeCompare(a.fecha || "")).slice(0, lim);
+        const total = items.reduce((s, c) => s + (c.total || 0), 0);
+        return {
+          total_resultados: items.length,
+          total_monto: fmtCRC(total),
+          compras: items.map(c => ({
+            proveedor: c.proveedorNombre || c.proveedor || "—",
+            fecha:     c.fecha || "—",
+            total:     fmtCRC(c.total || 0),
+            estado:    c.estado || "—",
+          })),
+        };
+      }
+
+      case "resumen_financiero": {
+        const periodo = input.periodo || "mes";
+        const ahora = new Date();
+        let fechaDesde;
+        if (periodo === "hoy")      fechaDesde = hoy();
+        else if (periodo === "semana") {
+          const d = new Date(ahora); d.setDate(d.getDate() - 7);
+          fechaDesde = d.toISOString().slice(0, 10);
+        } else if (periodo === "mes") {
+          fechaDesde = mesActual() + "-01";
+        } else if (periodo === "trimestre") {
+          const d = new Date(ahora); d.setMonth(d.getMonth() - 3);
+          fechaDesde = d.toISOString().slice(0, 10);
+        } else { // año
+          fechaDesde = ahora.getFullYear() + "-01-01";
+        }
+
+        const facturas  = cargarDato(empresaId, "facturas").filter(f => (f.fecha || "") >= fechaDesde);
+        const compras   = cargarDato(empresaId, "compras").filter(c => (c.fecha || "") >= fechaDesde);
+        const cxc       = cargarDato(empresaId, "cxc").filter(d => Math.max(0, (d.total || 0) - (d.pagado || 0)) > 0);
+        const cxp       = cargarDato(empresaId, "cxp").filter(d => Math.max(0, (d.total || 0) - (d.pagado || 0)) > 0);
+        const inventario = cargarDato(empresaId, "inventario").filter(p => p.activo !== false);
+
+        const totalVentas  = facturas.reduce((s, f) => s + (f.total || 0), 0);
+        const totalGastos  = compras.reduce((s, c) => s + (c.total || 0), 0);
+        const totalCxC     = cxc.reduce((s, d) => s + Math.max(0, (d.total || 0) - (d.pagado || 0)), 0);
+        const totalCxP     = cxp.reduce((s, d) => s + Math.max(0, (d.total || 0) - (d.pagado || 0)), 0);
+        const cxcVencidas  = cxc.filter(d => d.fechaVencimiento && d.fechaVencimiento < hoy());
+        const stockBajo    = inventario.filter(p => (p.stock || 0) <= (p.stockMin || 0));
+
+        // Top 5 clientes por ventas
+        const porCliente = {};
+        facturas.forEach(f => {
+          const k = f.clienteNombre || f.cliente || "Sin nombre";
+          porCliente[k] = (porCliente[k] || 0) + (f.total || 0);
+        });
+        const topClientes = Object.entries(porCliente)
+          .sort((a, b) => b[1] - a[1]).slice(0, 5)
+          .map(([n, t]) => ({ cliente: n, total: fmtCRC(t) }));
+
+        const settings = cargarObjeto(empresaId, "settings");
+
+        return {
+          empresa:      settings.nombreNegocio || "—",
+          periodo,
+          fecha_desde:  fechaDesde,
+          fecha_hasta:  hoy(),
+          ventas: {
+            total:     fmtCRC(totalVentas),
+            facturas:  facturas.length,
+            top_clientes: topClientes,
+          },
+          gastos: {
+            total:   fmtCRC(totalGastos),
+            compras: compras.length,
+          },
+          utilidad_bruta: fmtCRC(totalVentas - totalGastos),
+          cxc: {
+            total_pendiente: fmtCRC(totalCxC),
+            cuentas: cxc.length,
+            vencidas: cxcVencidas.length,
+          },
+          cxp: {
+            total_pendiente: fmtCRC(totalCxP),
+            cuentas: cxp.length,
+          },
+          inventario: {
+            total_productos: inventario.length,
+            bajo_minimo:     stockBajo.length,
+          },
+        };
+      }
+
+      default:
+        return { error: `Herramienta "${nombre}" no reconocida.` };
+    }
+  } catch (err) {
+    console.error(`[asistente/tool:${nombre}]`, err.message);
+    return { error: `Error ejecutando ${nombre}: ${err.message}` };
   }
-
-  // ── CXC ───────────────────────────────────────────────────────────────────
-  if (datos["cxc"]) {
-    const cxc = datos["cxc"] || [];
-    const pendientes = cxc.filter(d => Math.max(0, (d.total || 0) - (d.pagado || 0)) > 0);
-    const totalPend  = pendientes.reduce((s, d) => s + Math.max(0, (d.total || 0) - (d.pagado || 0)), 0);
-    const vencidas   = pendientes.filter(d => d.fechaVencimiento && d.fechaVencimiento < hoy());
-    const totalVenc  = vencidas.reduce((s, d) => s + Math.max(0, (d.total || 0) - (d.pagado || 0)), 0);
-    const listaVenc  = vencidas.slice(0, 5).map(d =>
-      `${d.clienteNombre || d.cliente || "?"}: ${fmtCRC(Math.max(0, (d.total || 0) - (d.pagado || 0)))} (vence ${d.fechaVencimiento})`
-    ).join("\n    ");
-
-    secciones.push(
-      `CXC (CUENTAS POR COBRAR):\n` +
-      `  Total pendiente: ${fmtCRC(totalPend)} en ${pendientes.length} cuentas\n` +
-      `  Vencidas: ${fmtCRC(totalVenc)} en ${vencidas.length} cuentas\n` +
-      (listaVenc ? `  Detalle vencidas:\n    ${listaVenc}` : "")
-    );
-  }
-
-  // ── CXP ───────────────────────────────────────────────────────────────────
-  if (datos["cxp"]) {
-    const cxp = datos["cxp"] || [];
-    const pend    = cxp.filter(d => Math.max(0, (d.total || 0) - (d.pagado || 0)) > 0);
-    const totalP  = pend.reduce((s, d) => s + Math.max(0, (d.total || 0) - (d.pagado || 0)), 0);
-    secciones.push(
-      `CXP (CUENTAS POR PAGAR):\n` +
-      `  Total pendiente con proveedores: ${fmtCRC(totalP)} en ${pend.length} cuentas`
-    );
-  }
-
-  // ── Inventario ────────────────────────────────────────────────────────────
-  if (datos["inventario"]) {
-    const inv     = datos["inventario"] || [];
-    const activos = inv.filter(p => p.activo !== false);
-    const bajoMin = activos.filter(p => (p.stock || 0) <= (p.stockMin || 0));
-    const sinStock = activos.filter(p => (p.stock || 0) === 0);
-    const bajoList = bajoMin.slice(0, 8).map(p =>
-      `${p.nombre} (stock: ${p.stock || 0}, mín: ${p.stockMin || 0})`
-    ).join(", ");
-
-    secciones.push(
-      `INVENTARIO:\n` +
-      `  Total productos activos: ${activos.length}\n` +
-      `  Bajo mínimo (${bajoMin.length}): ${bajoList || "ninguno"}\n` +
-      `  Sin stock: ${sinStock.length}`
-    );
-  }
-
-  // ── Compras ───────────────────────────────────────────────────────────────
-  if (datos["compras"]) {
-    const compras  = datos["compras"] || [];
-    const recientes = compras.filter(c => (c.fecha || "") >= hd);
-    const total    = recientes.reduce((s, c) => s + (c.total || 0), 0);
-    secciones.push(
-      `COMPRAS (últimos 30d):\n` +
-      `  ${recientes.length} facturas proveedor | Total: ${fmtCRC(total)}`
-    );
-  }
-
-  // ── Empleados / Planillas ─────────────────────────────────────────────────
-  if (datos["empleados"]) {
-    const emp = datos["empleados"] || [];
-    secciones.push(`EMPLEADOS: ${emp.filter(e => e.activo !== false).length} activos`);
-  }
-  if (datos["planillas"]) {
-    const pl   = datos["planillas"] || [];
-    const ult  = pl.filter(p => (p.mes || "") >= mesActual().slice(0, 7));
-    const tot  = ult.reduce((s, p) => s + (p.totalNeto || 0), 0);
-    secciones.push(`PLANILLAS: Nómina reciente: ${fmtCRC(tot)}`);
-  }
-
-  // ── Asientos / Balances ───────────────────────────────────────────────────
-  if (datos["asientos"]) {
-    const asientos = datos["asientos"] || [];
-    const recientes = asientos.filter(a => (a.fecha || "") >= hd);
-    secciones.push(`ASIENTOS CONTABLES: ${recientes.length} en últimos 30d (${asientos.length} total)`);
-  }
-  if (datos["balances"]) {
-    const bal = datos["balances"];
-    if (bal) secciones.push(`BALANCES: Datos disponibles para consulta`);
-  }
-
-  // ── Pedidos ───────────────────────────────────────────────────────────────
-  if (datos["pedidos"]) {
-    const ped     = datos["pedidos"] || [];
-    const abiertos = ped.filter(p => p.estado !== "entregado" && p.estado !== "cancelado");
-    secciones.push(`PEDIDOS: ${abiertos.length} abiertos de ${ped.length} total`);
-  }
-
-  // ── Cotizaciones ──────────────────────────────────────────────────────────
-  if (datos["cotizaciones"]) {
-    const cot     = datos["cotizaciones"] || [];
-    const abiertas = cot.filter(c => c.estado === "borrador" || c.estado === "enviada");
-    secciones.push(`COTIZACIONES: ${abiertas.length} abiertas de ${cot.length} total`);
-  }
-
-  // ── Contactos ─────────────────────────────────────────────────────────────
-  if (datos["contactos"]) {
-    const con = datos["contactos"] || [];
-    const clientes   = con.filter(c => c.tipo === "cliente"   || !c.tipo);
-    const proveedores = con.filter(c => c.tipo === "proveedor");
-    secciones.push(`CONTACTOS: ${clientes.length} clientes, ${proveedores.length} proveedores`);
-  }
-
-  // ── Flujo de caja ─────────────────────────────────────────────────────────
-  if (datos["flujo_caja"]) {
-    const fc = datos["flujo_caja"] || [];
-    secciones.push(`FLUJO DE CAJA: ${fc.length} movimientos registrados`);
-  }
-
-  return secciones.join("\n\n");
 }
 
 // ── POST /api/asistente/chat ──────────────────────────────────────────────────
-
 router.post("/chat", requireJWT, checkQuota, async (req, res) => {
   try {
-    const { sub: userId, empresaId, rol = "admin", email } = req.jwtPayload;
+    const { sub: userId, empresaId, rol = "admin" } = req.jwtPayload;
 
-    if (!empresaId) {
+    if (!empresaId)
       return res.status(400).json({ error: "Usuario no tiene empresa asignada." });
-    }
-
-    if (!config.anthropicApiKey) {
+    if (!config.anthropicApiKey)
       return res.status(500).json({ error: "ANTHROPIC_API_KEY no configurada en el servidor." });
-    }
 
     const { messages = [] } = req.body;
-    if (!messages.length) {
+    if (!messages.length)
       return res.status(400).json({ error: "messages requerido." });
-    }
 
-    // ── 1. Cargar datos de la empresa según rol ─────────────────────────────
-    const clavesPermitidas = ROLE_CLAVES[rol] ?? ROLE_CLAVES["colaborador"];
-
-    let rows;
-    if (clavesPermitidas === null) {
-      // admin / sin restricción: todo
-      rows = db.prepare(
-        "SELECT clave, valor FROM cloud_data WHERE empresa_id = ?"
-      ).all(empresaId);
-    } else {
-      const placeholders = clavesPermitidas.map(() => "?").join(", ");
-      rows = db.prepare(
-        `SELECT clave, valor FROM cloud_data WHERE empresa_id = ? AND clave IN (${placeholders})`
-      ).all(empresaId, ...clavesPermitidas);
-    }
-
-    // Parsear y construir mapa { clave: datos }
-    const datosEmpresa = {};
-    // Siempre incluir settings (nombre de empresa, moneda)
-    const settingsRow = db.prepare(
-      "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'settings'"
-    ).get(empresaId);
-    if (settingsRow) {
-      datosEmpresa["settings"] = parse(settingsRow.valor) || {};
-    }
-    for (const row of rows) {
-      datosEmpresa[row.clave] = parse(row.valor) ?? row.valor;
-    }
-
-    // Obtener nombre de empresa del usuario si no hay settings
+    // Obtener nombre de empresa
     const userRow = db.prepare("SELECT empresa_nombre FROM users WHERE id = ?").get(userId);
-    const empresaNombre = datosEmpresa["settings"]?.nombreNegocio
-      || userRow?.empresa_nombre
-      || "la empresa";
+    const settings = cargarObjeto(empresaId, "settings");
+    const empresaNombre = settings.nombreNegocio || userRow?.empresa_nombre || "la empresa";
 
-    // ── 2. Construir contexto ───────────────────────────────────────────────
-    const contexto = buildContexto(datosEmpresa, rol, empresaNombre);
+    // Limpiar mensajes entrantes
+    const msgLimpios = messages
+      .filter(m => (m.role === "user" || m.role === "assistant") && m.content)
+      .slice(-10); // últimos 10 de historia
 
-    // ── 3. System prompt ────────────────────────────────────────────────────
+    if (!msgLimpios.length || msgLimpios[msgLimpios.length - 1].role !== "user")
+      return res.status(400).json({ error: "El último mensaje debe ser del usuario." });
+
     const rolesNombres = {
       admin: "Administrador", gerencia: "Gerencia", ventas: "Ventas",
-      contabilidad: "Contabilidad", bodega: "Bodega", rrhh: "RRHH", colaborador: "Colaborador",
+      contabilidad: "Contabilidad", bodega: "Bodega", rrhh: "RRHH",
+      colaborador: "Colaborador", superadmin: "SuperAdmin",
     };
-    const rolNombre = rolesNombres[rol] || rol;
 
     const systemPrompt = `Eres el asistente IA de Organízalo.AI para la empresa "${empresaNombre}".
-El usuario que te consulta tiene rol: ${rolNombre}.
+El usuario tiene rol: ${rolesNombres[rol] || rol}. Fecha de hoy: ${hoy()}.
 
-REGLAS IMPORTANTES:
-- Solo responde con base en los datos del sistema que se te proporcionan abajo.
-- No inventes cifras, nombres de clientes, ni información que no esté en los datos.
-- Si la información no está disponible en los datos, dilo claramente: "No tengo esa información disponible."
-- Responde SIEMPRE en español, de forma clara, concisa y profesional.
-- Usa ₡ para colones costarricenses y $ para dólares.
-- No menciones restricciones de rol al usuario — simplemente responde solo lo que corresponde.
-- Si el usuario pide un análisis, ofrece observaciones útiles y accionables basadas en los datos.
-- Puedes hacer cálculos, comparaciones y proyecciones basadas en los datos proporcionados.
+Tenés acceso a herramientas para consultar los datos reales de la empresa en tiempo real.
+Usá las herramientas que necesites para responder con datos exactos.
 
-DATOS DEL SISTEMA (actualizados a ${hoy()}):
-${contexto || "No hay datos sincronizados aún para esta empresa."}`;
+REGLAS:
+- Siempre usá las herramientas para obtener datos antes de responder. No inventes cifras.
+- Si la herramienta devuelve datos vacíos, decilo claramente.
+- Respondé siempre en español, de forma clara y concisa.
+- Usá ₡ para colones y $ para dólares.
+- Si el usuario pide un análisis, usá resumen_financiero primero y complementá con otras tools.
+- Podés llamar varias herramientas en una misma respuesta si la pregunta lo requiere.`;
 
-    // ── 4. Llamar a Anthropic ───────────────────────────────────────────────
     const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
-    // Validar y limpiar mensajes (solo user/assistant, contenido string)
-    const msgLimpios = messages
-      .filter(m => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
-      .slice(-20); // máximo 20 mensajes de historia
+    // ── Loop agentico ─────────────────────────────────────────────────────────
+    let mensajes = [...msgLimpios];
+    let totalTokensIn  = 0;
+    let totalTokensOut = 0;
+    let toolsUsados    = [];
+    let respuestaFinal = null;
 
-    if (!msgLimpios.length) {
-      return res.status(400).json({ error: "No hay mensajes válidos." });
+    for (let i = 0; i < MAX_ITERACIONES; i++) {
+      const response = await anthropic.messages.create({
+        model:      "claude-haiku-4-5-20251001",
+        max_tokens: 1500,
+        system:     systemPrompt,
+        tools:      TOOLS,
+        messages:   mensajes,
+      });
+
+      totalTokensIn  += response.usage?.input_tokens  || 0;
+      totalTokensOut += response.usage?.output_tokens || 0;
+
+      // ¿Terminó con texto?
+      if (response.stop_reason === "end_turn") {
+        const textBlock = response.content.find(b => b.type === "text");
+        respuestaFinal = textBlock?.text || "No pude generar una respuesta.";
+        break;
+      }
+
+      // ¿Quiere usar tools?
+      if (response.stop_reason === "tool_use") {
+        const toolUseBlocks = response.content.filter(b => b.type === "tool_use");
+
+        // Agregar respuesta del asistente al historial
+        mensajes.push({ role: "assistant", content: response.content });
+
+        // Ejecutar cada tool y armar resultados
+        const toolResults = toolUseBlocks.map(tb => {
+          toolsUsados.push(tb.name);
+          const resultado = ejecutarTool(tb.name, tb.input || {}, empresaId);
+          return {
+            type:        "tool_result",
+            tool_use_id: tb.id,
+            content:     JSON.stringify(resultado),
+          };
+        });
+
+        // Agregar resultados al historial para el próximo turno
+        mensajes.push({ role: "user", content: toolResults });
+        continue;
+      }
+
+      // stop_reason inesperado — terminar con lo que haya
+      const textBlock = response.content.find(b => b.type === "text");
+      respuestaFinal = textBlock?.text || "No pude generar una respuesta.";
+      break;
     }
 
-    // El último mensaje debe ser del usuario
-    const ultimo = msgLimpios[msgLimpios.length - 1];
-    if (ultimo.role !== "user") {
-      return res.status(400).json({ error: "El último mensaje debe ser del usuario." });
+    if (!respuestaFinal) {
+      respuestaFinal = "Alcancé el límite de operaciones internas. Por favor reformulá la pregunta.";
     }
 
-    const response = await anthropic.messages.create({
-      model:      "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
-      system:     systemPrompt,
-      messages:   msgLimpios,
-    });
-
-    const reply = response.content?.[0]?.text || "No pude generar una respuesta.";
-
-    // Registrar uso (no bloquea la respuesta)
-    registerUsage(empresaId, response.usage);
+    // Registrar uso total de tokens
+    registerUsage(empresaId, { input_tokens: totalTokensIn, output_tokens: totalTokensOut });
 
     const uso = req.apiUsage;
     res.json({
-      reply,
-      rol,
-      empresaId,
+      reply: respuestaFinal,
+      toolsUsados: [...new Set(toolsUsados)],
       cuota: uso ? {
-        usados: uso.mensajes_usados + 1,
-        limite: uso.limite_mensajes,
+        usados:    uso.mensajes_usados + 1,
+        limite:    uso.limite_mensajes,
         restantes: Math.max(0, uso.limite_mensajes - uso.mensajes_usados - 1),
       } : null,
     });
