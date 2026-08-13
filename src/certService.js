@@ -51,15 +51,20 @@ function decrypt(stored) {
 // ── Asegurar tabla en DB ──────────────────────────────────────────────────────
 db.exec(`
   CREATE TABLE IF NOT EXISTS empresa_certs (
-    empresa_id   TEXT PRIMARY KEY,
-    cert_enc     TEXT NOT NULL,
-    pass_enc     TEXT NOT NULL,
-    cedula       TEXT,
-    nombre       TEXT,
-    subido_en    TEXT NOT NULL,
+    empresa_id     TEXT PRIMARY KEY,
+    cert_enc       TEXT NOT NULL,
+    pass_enc       TEXT NOT NULL,
+    cedula         TEXT,
+    nombre         TEXT,
+    subido_en      TEXT NOT NULL,
     actualizado_en TEXT NOT NULL
   );
 `);
+
+// Agregar columnas ATV si no existen (migracion no destructiva)
+try { db.exec("ALTER TABLE empresa_certs ADD COLUMN atv_usuario TEXT;"); } catch {}
+try { db.exec("ALTER TABLE empresa_certs ADD COLUMN atv_pass_enc TEXT;"); }  catch {}
+try { db.exec("ALTER TABLE empresa_certs ADD COLUMN atv_actualizado_en TEXT;"); } catch {}
 
 // ── API pública ───────────────────────────────────────────────────────────────
 
@@ -116,10 +121,18 @@ function getCert(empresaId) {
  */
 function getCertStatus(empresaId) {
   const row = db
-    .prepare("SELECT empresa_id, cedula, nombre, subido_en FROM empresa_certs WHERE empresa_id = ?")
+    .prepare("SELECT empresa_id, cedula, nombre, subido_en, atv_usuario, atv_actualizado_en FROM empresa_certs WHERE empresa_id = ?")
     .get(empresaId);
   if (!row) return null;
-  return { configured: true, cedula: row.cedula, nombre: row.nombre, subidoEn: row.subido_en };
+  return {
+    configured: true,
+    cedula: row.cedula,
+    nombre: row.nombre,
+    subidoEn: row.subido_en,
+    atvConfigurado: !!row.atv_usuario,
+    atvUsuario: row.atv_usuario || null,
+    atvActualizadoEn: row.atv_actualizado_en || null,
+  };
 }
 
 /**
@@ -129,4 +142,46 @@ function deleteCert(empresaId) {
   db.prepare("DELETE FROM empresa_certs WHERE empresa_id = ?").run(empresaId);
 }
 
-module.exports = { saveCert, getCert, getCertStatus, deleteCert };
+/**
+ * Guarda (o actualiza) las credenciales ATV de Hacienda para una empresa.
+ * @param {string} empresaId
+ * @param {string} usuario  — usuario del sistema ATV
+ * @param {string} password — contraseña del sistema ATV
+ */
+function saveATV(empresaId, usuario, password) {
+  const passEnc = encrypt(Buffer.from(password, "utf8"));
+  const now = new Date().toISOString();
+
+  const exists = db
+    .prepare("SELECT empresa_id FROM empresa_certs WHERE empresa_id = ?")
+    .get(empresaId);
+
+  if (exists) {
+    db.prepare(`
+      UPDATE empresa_certs
+      SET atv_usuario=?, atv_pass_enc=?, atv_actualizado_en=?
+      WHERE empresa_id=?
+    `).run(usuario, passEnc, now, empresaId);
+  } else {
+    // No hay cert todavía — crear fila temporal solo con ATV (cert_enc y pass_enc ficticios vacíos no válidos)
+    // En producción siempre se sube el cert primero, pero esto evita errores de FK
+    throw new Error("Primero subí el certificado .p12 antes de guardar credenciales ATV.");
+  }
+}
+
+/**
+ * Obtiene las credenciales ATV descifradas de una empresa.
+ * @returns {{ usuario: string, password: string } | null}
+ */
+function getATV(empresaId) {
+  const row = db
+    .prepare("SELECT atv_usuario, atv_pass_enc FROM empresa_certs WHERE empresa_id = ?")
+    .get(empresaId);
+  if (!row || !row.atv_usuario || !row.atv_pass_enc) return null;
+  return {
+    usuario: row.atv_usuario,
+    password: decrypt(row.atv_pass_enc).toString("utf8"),
+  };
+}
+
+module.exports = { saveCert, getCert, getCertStatus, deleteCert, saveATV, getATV };

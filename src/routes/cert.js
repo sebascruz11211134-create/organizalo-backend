@@ -89,4 +89,20 @@ router.delete("/", requireJWT, (req, res) => {
   }
 });
 
+// ── POST /api/cert/atv — Guardar credenciales ATV de Hacienda ─────────────────
+router.post("/atv", requireJWT, (req, res) => {
+  try {
+    const empresaId = req.jwtPayload.empresaId || req.jwtPayload.id;
+    const { usuario, password } = req.body;
+    if (!usuario || !password) {
+      return res.status(400).json({ error: "Usuario y contraseña ATV son requeridos" });
+    }
+    certService.saveATV(empresaId, usuario, password);
+    res.json({ ok: true, message: "Credenciales ATV guardadas correctamente" });
+  } catch (err) {
+    console.error("[cert/atv]", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
