@@ -22,6 +22,7 @@ const Anthropic = require("@anthropic-ai/sdk");
 const { v4: uuidv4 } = require("uuid");
 const { db }    = require("../db");
 const config    = require("../config");
+const { registerUsage } = require("../middleware/apiQuota");
 
 const router = express.Router();
 
@@ -237,6 +238,9 @@ INSTRUCCIONES:
       system: systemPrompt,
       messages: [{ role: "user", content: texto }],
     });
+
+    // Registrar uso de tokens
+    registerUsage(empresaId, response.usage);
 
     const respuestaCompleta = response.content?.[0]?.text || "No pude procesar su solicitud.";
 

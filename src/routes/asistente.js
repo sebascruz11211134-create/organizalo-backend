@@ -17,6 +17,7 @@ const jwt       = require("jsonwebtoken");
 const Anthropic = require("@anthropic-ai/sdk");
 const { db }    = require("../db");
 const config    = require("../config");
+const { checkQuota, registerUsage } = require("../middleware/apiQuota");
 
 const router = express.Router();
 
@@ -255,7 +256,7 @@ function buildContexto(datos, rol, empresaNombre) {
 
 // ── POST /api/asistente/chat ──────────────────────────────────────────────────
 
-router.post("/chat", requireJWT, async (req, res) => {
+router.post("/chat", requireJWT, checkQuota, async (req, res) => {
   try {
     const { sub: userId, empresaId, rol = "admin", email } = req.jwtPayload;
 
@@ -360,7 +361,20 @@ ${contexto || "No hay datos sincronizados aún para esta empresa."}`;
 
     const reply = response.content?.[0]?.text || "No pude generar una respuesta.";
 
-    res.json({ reply, rol, empresaId });
+    // Registrar uso (no bloquea la respuesta)
+    registerUsage(empresaId, response.usage);
+
+    const uso = req.apiUsage;
+    res.json({
+      reply,
+      rol,
+      empresaId,
+      cuota: uso ? {
+        usados: uso.mensajes_usados + 1,
+        limite: uso.limite_mensajes,
+        restantes: Math.max(0, uso.limite_mensajes - uso.mensajes_usados - 1),
+      } : null,
+    });
 
   } catch (err) {
     console.error("[asistente/chat]", err);

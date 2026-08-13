@@ -438,4 +438,64 @@ router.delete("/codigos/:id", ...auth, (req, res) => {
   }
 });
 
+// ── API Usage — consumo de IA por empresa ─────────────────────────────────────
+const { getUsageStats, setLimiteEmpresa, QUOTA_DEFAULT_DIARIA } = require("../middleware/apiQuota");
+
+// GET /api/admin/api-usage?dias=30 — consumo de todas las empresas
+router.get("/api-usage", ...auth, (req, res) => {
+  try {
+    const dias = parseInt(req.query.dias) || 30;
+    const stats = getUsageStats({ dias });
+
+    // Agrupar por empresa para el resumen
+    const porEmpresa = {};
+    stats.forEach(row => {
+      if (!porEmpresa[row.empresa_id]) {
+        porEmpresa[row.empresa_id] = {
+          empresaId:    row.empresa_id,
+          empresaNombre: row.empresa_nombre || row.empresa_id,
+          totalMensajes: 0,
+          totalTokensIn: 0,
+          totalTokensOut: 0,
+          limiteDiario: row.limite_mensajes,
+          dias: [],
+        };
+      }
+      const e = porEmpresa[row.empresa_id];
+      e.totalMensajes  += row.mensajes_usados;
+      e.totalTokensIn  += row.tokens_entrada;
+      e.totalTokensOut += row.tokens_salida;
+      e.limiteDiario    = row.limite_mensajes; // tomar el más reciente
+      e.dias.push({ fecha: row.fecha, mensajes: row.mensajes_usados, tokensIn: row.tokens_entrada, tokensOut: row.tokens_salida });
+    });
+
+    res.json({
+      ok: true,
+      dias,
+      quotaDefault: QUOTA_DEFAULT_DIARIA,
+      empresas: Object.values(porEmpresa).sort((a, b) => b.totalMensajes - a.totalMensajes),
+    });
+  } catch (err) {
+    console.error("[admin/api-usage]", err);
+    res.status(500).json({ error: "Error interno." });
+  }
+});
+
+// PUT /api/admin/api-quota/:empresaId — cambiar límite diario de una empresa
+router.put("/api-quota/:empresaId", ...auth, (req, res) => {
+  try {
+    const { empresaId } = req.params;
+    const { limite } = req.body;
+
+    if (!limite || typeof limite !== "number" || limite < 1 || limite > 10000)
+      return res.status(400).json({ error: "limite debe ser un número entre 1 y 10000" });
+
+    setLimiteEmpresa(empresaId, limite);
+    res.json({ ok: true, empresaId, limite, mensaje: `Límite actualizado a ${limite} mensajes/día` });
+  } catch (err) {
+    console.error("[admin/api-quota]", err);
+    res.status(500).json({ error: "Error interno." });
+  }
+});
+
 module.exports = router;
