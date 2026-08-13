@@ -1,27 +1,12 @@
-name: Deploy to Railway
+# Railway deploy is handled via direct GitHub integration (not GitHub Actions).
+# This workflow is disabled.
+name: Deploy to Railway (disabled)
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch: # manual only
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Check Railway auth
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway whoami
-
-      - name: Deploy to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: |
-          railway up \
-            --service 910d6c1b-e28d-4c5b-aed9-70a568025469 \
-            --detach
+      - run: echo "Railway deploys automatically via GitHub integration."
