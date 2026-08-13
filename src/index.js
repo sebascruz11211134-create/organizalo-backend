@@ -224,6 +224,86 @@ async function verificarVencimientos() {
           }, db);
         }
       } catch {}
+
+      // ── Stock mínimo ────────────────────────────────────────────────────────
+      try {
+        const prodRow = db.prepare(
+          "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'productos'"
+        ).get(empresaId);
+        if (prodRow?.valor) {
+          let productos = [];
+          try { productos = JSON.parse(prodRow.valor); } catch {}
+          const bajos = productos.filter(p =>
+            p.stock != null &&
+            p.stock_minimo != null &&
+            p.stock_minimo > 0 &&
+            parseFloat(p.stock) <= parseFloat(p.stock_minimo)
+          );
+          for (const p of bajos) {
+            await ntfy.notifyByPrefs({
+              tipo:      "stock_bajo",
+              empresaId,
+              title:     `📦 Stock bajo: ${p.nombre}`,
+              message:   `Stock actual: ${p.stock} — mínimo: ${p.stock_minimo}`,
+              priority:  4,
+            }, db);
+          }
+        }
+      } catch {}
+
+      // ── Clientes inactivos → actualizar etapaCRM ────────────────────────────
+      try {
+        const factRow = db.prepare(
+          "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'facturas'"
+        ).get(empresaId);
+        const contRow = db.prepare(
+          "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'contactos'"
+        ).get(empresaId);
+
+        if (contRow?.valor) {
+          let contactos = [];
+          let facturas  = [];
+          try { contactos = JSON.parse(contRow.valor); } catch {}
+          try { facturas  = JSON.parse(factRow?.valor || "[]"); } catch {}
+
+          const hace90 = new Date(Date.now() - 90 * 86400_000).toISOString().slice(0, 10);
+          let changed  = false;
+
+          contactos = contactos.map(c => {
+            if (c.tipo !== "cliente" && c.tipo !== "ambos") return c;
+            if (c.etapaCRM === "inactivo") return c; // ya marcado
+
+            const nombre = (c.nombre || "").toLowerCase();
+            const ultimaFact = facturas
+              .filter(f => (f.cliente?.nombre || f.clienteNombre || "").toLowerCase().includes(nombre))
+              .map(f => f.fecha || f.creadoEn?.slice(0,10) || "")
+              .sort()
+              .reverse()[0];
+
+            if (!ultimaFact || ultimaFact < hace90) {
+              changed = true;
+              // Notificar una vez por cliente
+              ntfy.notifyByPrefs({
+                tipo:      "cliente_inactivo",
+                empresaId,
+                title:     `😴 Cliente inactivo: ${c.nombre}`,
+                message:   ultimaFact
+                  ? `Última compra: ${ultimaFact} (hace más de 90 días)`
+                  : "Sin facturas registradas",
+                priority:  2,
+              }, db).catch(() => {});
+              return { ...c, etapaCRM: "inactivo" };
+            }
+            return c;
+          });
+
+          if (changed) {
+            db.prepare(
+              "INSERT OR REPLACE INTO cloud_data (empresa_id, clave, valor, updated_at) VALUES (?, ?, ?, ?)"
+            ).run(empresaId, "contactos", JSON.stringify(contactos), new Date().toISOString());
+          }
+        }
+      } catch {}
     }
 
     console.log(`[cron] Vencimientos verificados para ${empresas.length} empresas`);

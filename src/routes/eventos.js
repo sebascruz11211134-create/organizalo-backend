@@ -137,6 +137,38 @@ router.patch("/:id/completar", requireJWT, (req, res) => {
   }
 });
 
+// ── DELETE por título (usado al saldar CXC/CXP) ──────────────────────────────
+// Body: { tituloMatch, fecha }  — elimina el primer evento cuyo título contiene tituloMatch y tiene esa fecha
+router.delete("/por-titulo", requireJWT, (req, res) => {
+  try {
+    const empresaId = req.jwtPayload.empresaId || req.jwtPayload.id;
+    const edb = getEmpresaDb(empresaId);
+    const { tituloMatch, fecha } = req.body;
+    if (!tituloMatch) return res.status(400).json({ error: "tituloMatch requerido" });
+
+    let rows;
+    if (fecha) {
+      rows = edb.prepare(
+        "SELECT id FROM eventos WHERE titulo LIKE ? AND fecha = ? LIMIT 5"
+      ).all(`%${tituloMatch}%`, fecha);
+    } else {
+      rows = edb.prepare(
+        "SELECT id FROM eventos WHERE titulo LIKE ? LIMIT 5"
+      ).all(`%${tituloMatch}%`);
+    }
+
+    let deleted = 0;
+    for (const row of rows) {
+      edb.prepare("DELETE FROM eventos WHERE id = ?").run(row.id);
+      deleted++;
+    }
+    res.json({ ok: true, deleted });
+  } catch (err) {
+    console.error("[eventos/por-titulo DELETE]", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── DELETE evento ─────────────────────────────────────────────────────────────
 router.delete("/:id", requireJWT, (req, res) => {
   try {
