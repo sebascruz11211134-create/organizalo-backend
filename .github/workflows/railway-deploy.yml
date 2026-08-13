@@ -13,12 +13,15 @@ jobs:
       - name: Install Railway CLI
         run: npm install -g @railway/cli
 
+      - name: Check Railway auth
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway whoami
+
       - name: Deploy to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: |
           railway up \
-            --project e1d5b523-5f13-4dd1-9801-036aff8170b0 \
             --service 910d6c1b-e28d-4c5b-aed9-70a568025469 \
-            --environment b2e47f5c-3851-4676-ae1c-936732d754ea \
             --detach
