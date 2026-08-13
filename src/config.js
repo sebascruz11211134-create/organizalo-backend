@@ -35,6 +35,8 @@ module.exports = {
   anthropicApiKey: required("ANTHROPIC_API_KEY"),
   resendApiKey:    required("RESEND_API_KEY"),
   publicUrl:       required("PUBLIC_URL", "https://api.organizalo.ai"),
+  bccrToken:       required("BCCR_TOKEN"),
+  bccrEmail:       required("BCCR_EMAIL", "sebascruz11211134@gmail.com"),
   modoSimulacion: String(process.env.MODO_SIMULACION || "true").toLowerCase() === "true",
   emisor: {
     cedulaTipo: required("EMISOR_CEDULA_TIPO", "02"),

@@ -20,9 +20,10 @@ const eventosRouter   = require("./routes/eventos");
 const crmRouter       = require("./routes/crm");
 const whatsappRouter  = require("./routes/whatsapp");
 const { enviarRecordatoriosHoy } = require("./routes/whatsapp");
-const asistenteRouter = require("./routes/asistente");
-const rockyRouter     = require("./routes/rocky");
-const ntfyRouter      = require("./routes/ntfy");
+const asistenteRouter   = require("./routes/asistente");
+const rockyRouter       = require("./routes/rocky");
+const ntfyRouter        = require("./routes/ntfy");
+const tipocambioRouter  = require("./routes/tipocambio");
 
 const app    = express();
 const server = http.createServer(app);
@@ -113,9 +114,10 @@ app.use("/api/recepcion",  recepcionRouter);
 app.use("/api/eventos",    eventosRouter);
 app.use("/api/crm",        crmRouter);
 app.use("/api/whatsapp",   whatsappRouter);
-app.use("/api/asistente",  asistenteRouter);
-app.use("/api/rocky",      rockyRouter);
-app.use("/api/ntfy",       ntfyRouter);
+app.use("/api/asistente",   asistenteRouter);
+app.use("/api/rocky",       rockyRouter);
+app.use("/api/ntfy",        ntfyRouter);
+app.use("/api/tipocambio",  tipocambioRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: "Ruta no encontrada." });
