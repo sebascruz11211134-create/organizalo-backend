@@ -44,6 +44,15 @@ router.post("/push", requireJWT, (req, res) => {
       insert.run(clave, JSON.stringify(valor), now);
     }
 
+    // ── Notificar a todos los demás clientes de la misma empresa en tiempo real ──
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`empresa:${empresaId}:general`).emit("data:changed", {
+        updatedAt: now,
+        origen:    req.jwtPayload.userId || "unknown",
+      });
+    }
+
     res.json({ ok: true, claves: Object.keys(data).length });
   } catch (err) {
     console.error("[clouddata/push]", err);
