@@ -130,6 +130,10 @@ setInterval(() => {
   if (now.getHours() === 8 && now.getMinutes() < 5) {
     enviarRecordatoriosHoy().catch(console.error);
     verificarVencimientos().catch(console.error);
+    // Depreciación mensual: solo el día 1 de cada mes
+    if (now.getDate() === 1) {
+      generarAsientosDepreciacion().catch(console.error);
+    }
   }
 }, 5 * 60 * 1000);
 
@@ -309,6 +313,79 @@ async function verificarVencimientos() {
     console.log(`[cron] Vencimientos verificados para ${empresas.length} empresas`);
   } catch (err) {
     console.error("[cron/vencimientos]", err.message);
+  }
+}
+
+/**
+ * Genera asientos contables de depreciación mensual para todos los activos fijos
+ * activos de todas las empresas. Se ejecuta el día 1 de cada mes.
+ */
+async function generarAsientosDepreciacion() {
+  const { v4: uuidv4 } = require("uuid");
+  const hoy = new Date().toISOString().slice(0, 10);
+  const mes  = hoy.slice(0, 7); // YYYY-MM — para evitar duplicados del mismo mes
+
+  try {
+    const empresas = db.prepare(
+      "SELECT DISTINCT empresa_id FROM users WHERE empresa_id IS NOT NULL AND activo = 1"
+    ).all();
+
+    for (const { empresa_id: empresaId } of empresas) {
+      // Leer activos fijos del cloud_data
+      const row = db.prepare(
+        "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'activosFijos'"
+      ).get(empresaId);
+      if (!row?.valor) continue;
+
+      let activos = [];
+      try { activos = JSON.parse(row.valor); } catch { continue; }
+
+      // Leer asientos existentes para no duplicar este mes
+      const asRow = db.prepare(
+        "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'asientosContables'"
+      ).get(empresaId);
+      let asientos = [];
+      try { asientos = JSON.parse(asRow?.valor || "[]"); } catch {}
+
+      const yaDepreciado = asientos.some(a =>
+        a.autoGenerado && a.descripcion?.includes("Depreciación") && a.fecha?.startsWith(mes)
+      );
+      if (yaDepreciado) continue;
+
+      // Calcular depreciación mensual por activo
+      const nuevos = [];
+      for (const activo of activos) {
+        if (!activo.nombre || !activo.costo || !activo.fechaCompra) continue;
+        const costo        = parseFloat(activo.costo) || 0;
+        const residual     = parseFloat(activo.valorResidual) || 0;
+        const vidaMeses    = (parseInt(activo.vidaUtil) || 5) * 12;
+        const depMensual   = Math.max(0, (costo - residual) / vidaMeses);
+        if (depMensual <= 0) continue;
+
+        nuevos.push({
+          id: uuidv4(), numero: `DEP-${String(asientos.length + nuevos.length + 1).padStart(5,"0")}`,
+          estado: "confirmado", autoGenerado: true,
+          descripcion: `Depreciación mensual — ${activo.nombre}`,
+          fecha: hoy, totalDebe: depMensual, totalHaber: depMensual,
+          lineas: [
+            { cuentaCodigo: "6201", cuentaNombre: "Gasto depreciación", debe: depMensual, haber: 0 },
+            { cuentaCodigo: "1502", cuentaNombre: "Depreciación acumulada", debe: 0, haber: depMensual },
+          ],
+          creadoEn: new Date().toISOString(),
+        });
+      }
+
+      if (nuevos.length === 0) continue;
+
+      const actualizados = [...asientos, ...nuevos];
+      db.prepare(
+        "INSERT OR REPLACE INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?, ?, ?, ?)"
+      ).run(empresaId, "asientosContables", JSON.stringify(actualizados), new Date().toISOString());
+
+      console.log(`[cron/dep] ${nuevos.length} asientos de depreciación para empresa ${empresaId}`);
+    }
+  } catch (err) {
+    console.error("[cron/depreciacion]", err.message);
   }
 }
 
