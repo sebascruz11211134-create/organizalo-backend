@@ -44,6 +44,25 @@ Respondés de forma concisa, máximo 3-4 párrafos. No inventés funcionalidades
 const router = express.Router();
 const CANALES_DEFAULT = ["general", "facturación", "contabilidad", "inventario", "soporte"];
 
+// ── Typing indicator — en memoria, sin DB (ephemeral) ─────────────────────────
+// typingStore[empresaId][canal][userId] = { nombre, expires }
+const typingStore = {};
+const TYPING_TTL  = 4000; // ms
+
+function setTyping(empresaId, canal, userId, nombre) {
+  if (!typingStore[empresaId]) typingStore[empresaId] = {};
+  if (!typingStore[empresaId][canal]) typingStore[empresaId][canal] = {};
+  typingStore[empresaId][canal][userId] = { nombre, expires: Date.now() + TYPING_TTL };
+}
+
+function getTyping(empresaId, canal, excludeUserId) {
+  const now = Date.now();
+  const bucket = typingStore[empresaId]?.[canal] || {};
+  return Object.entries(bucket)
+    .filter(([uid, v]) => uid !== excludeUserId && v.expires > now)
+    .map(([, v]) => v.nombre);
+}
+
 function requireJWT(req, res, next) {
   const header = req.headers.authorization || "";
   const token  = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -119,6 +138,77 @@ router.post("/mensajes/:canal", requireJWT, (req, res) => {
     responderConIA({ empresaId, canal, texto: texto.trim(), io, edb }).catch(err => {
       console.error("[soporte-ia]", err.message);
     });
+  }
+});
+
+// ── POST /api/chat/typing/:canal — "estoy escribiendo" ────────────────────────
+router.post("/typing/:canal", requireJWT, (req, res) => {
+  const { empresaId, sub: userId } = req.jwtPayload;
+  const { canal } = req.params;
+  const user   = db.prepare("SELECT nombre FROM users WHERE id = ?").get(userId);
+  const nombre = user?.nombre || "Usuario";
+  setTyping(empresaId, canal, userId, nombre);
+  const io = req.app.get("io");
+  if (io) {
+    const writers = getTyping(empresaId, canal, null); // broadcast incluye a todos
+    io.to(`empresa:${empresaId}:${canal}`).emit("typing", { writers, canal });
+  }
+  res.json({ ok: true });
+});
+
+// ── GET /api/chat/typing/:canal — quién está escribiendo ─────────────────────
+router.get("/typing/:canal", requireJWT, (req, res) => {
+  const { empresaId, sub: userId } = req.jwtPayload;
+  const { canal } = req.params;
+  const writers = getTyping(empresaId, canal, userId);
+  res.json({ writers });
+});
+
+// ── POST /api/chat/mensajes/:canal/leer — marcar como leídos ─────────────────
+router.post("/mensajes/:canal/leer", requireJWT, (req, res) => {
+  const { empresaId, sub: userId } = req.jwtPayload;
+  const edb = getEmpresaDb(empresaId);
+  const { canal } = req.params;
+
+  // Crear tabla si no existe
+  edb.prepare(`
+    CREATE TABLE IF NOT EXISTS chat_leidos (
+      id         TEXT PRIMARY KEY,
+      canal      TEXT NOT NULL,
+      user_id    TEXT NOT NULL,
+      leido_en   TEXT NOT NULL,
+      UNIQUE(canal, user_id)
+    )
+  `).run();
+
+  const now = new Date().toISOString();
+  edb.prepare(
+    "INSERT OR REPLACE INTO chat_leidos (id, canal, user_id, leido_en) VALUES (?, ?, ?, ?)"
+  ).run(uuidv4(), canal, userId, now);
+
+  // Emitir visto a todos en la sala
+  const io = req.app.get("io");
+  if (io) io.to(`empresa:${empresaId}:${canal}`).emit("leido", { canal, userId, leido_en: now });
+
+  res.json({ ok: true });
+});
+
+// ── GET /api/chat/mensajes/:canal/lecturas — quiénes leyeron ─────────────────
+router.get("/mensajes/:canal/lecturas", requireJWT, (req, res) => {
+  const { empresaId } = req.jwtPayload;
+  const edb = getEmpresaDb(empresaId);
+  const { canal } = req.params;
+  try {
+    edb.prepare(`CREATE TABLE IF NOT EXISTS chat_leidos (
+      id TEXT PRIMARY KEY, canal TEXT NOT NULL, user_id TEXT NOT NULL,
+      leido_en TEXT NOT NULL, UNIQUE(canal, user_id)
+    )`).run();
+    const lecturas = edb.prepare(
+      "SELECT user_id, leido_en FROM chat_leidos WHERE canal = ?"
+    ).all(canal);
+    res.json({ lecturas });
+  } catch {
+    res.json({ lecturas: [] });
   }
 });
 
