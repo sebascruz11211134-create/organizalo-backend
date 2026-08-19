@@ -17,7 +17,7 @@ const config   = require("../config");
 const router = express.Router();
 
 // El superadmin puede registrarse sin código de acceso
-const SUPERADMIN_EMAIL = "sebascruz11211134@gmail.com";
+const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL;
 
 // ── Validación de contraseña fuerte ──────────────────────────────────────────
 function validatePasswordStrength(password) {
@@ -41,8 +41,18 @@ function signToken(user) {
   return jwt.sign(
     { sub: user.id, email: user.email, empresaId: user.empresa_id, rol: user.rol, plan: user.plan },
     jwtSecret(),
-    { expiresIn: "90d" }
+    { expiresIn: "7d" }
   );
+}
+
+function issueRefreshToken(userId) {
+  const token     = uuidv4();
+  const now       = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 30 * 86400_000).toISOString(); // 30 días
+  db.prepare(
+    "INSERT INTO refresh_tokens (id, user_id, token, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, 0, ?)"
+  ).run(uuidv4(), userId, token, expiresAt, now);
+  return token;
 }
 
 function userPublic(row) {
@@ -171,10 +181,11 @@ router.post("/register", async (req, res) => {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
     `).run(id, nombre.trim(), emailNorm, passwordHash, telefono || null, empresaId, empresaNom, rol, planUser, trialEndsUser, username, now, now);
 
-    const user  = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
-    const token = signToken(user);
+    const user         = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+    const token        = signToken(user);
+    const refreshToken = issueRefreshToken(id);
 
-    res.status(201).json({ token, user: userPublic(user) });
+    res.status(201).json({ token, refreshToken, user: userPublic(user) });
   } catch (err) {
     console.error("[auth/register]", err);
     res.status(500).json({ error: "Error interno. Intente de nuevo." });
@@ -202,8 +213,9 @@ router.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Usuario o contraseña incorrectos." });
 
-    const token = signToken(user);
-    res.json({ token, user: userPublic(user) });
+    const token        = signToken(user);
+    const refreshToken = issueRefreshToken(user.id);
+    res.json({ token, refreshToken, user: userPublic(user) });
   } catch (err) {
     console.error("[auth/login]", err);
     res.status(500).json({ error: "Error interno. Intente de nuevo." });
@@ -233,9 +245,39 @@ router.get("/me", requireJWT, (req, res) => {
   }
 });
 
+// ── POST /api/auth/refresh ────────────────────────────────────────────────────
+
+router.post("/refresh", (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (!refreshToken) return res.status(400).json({ error: "Refresh token requerido." });
+
+  const row = db.prepare(
+    "SELECT * FROM refresh_tokens WHERE token = ? AND revoked = 0"
+  ).get(refreshToken);
+
+  if (!row) return res.status(401).json({ error: "Refresh token inválido o revocado." });
+  if (new Date(row.expires_at) < new Date())
+    return res.status(401).json({ error: "Refresh token vencido. Iniciá sesión nuevamente." });
+
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(row.user_id);
+  if (!user || !user.activo) return res.status(401).json({ error: "Usuario no encontrado o inactivo." });
+
+  // Rotar refresh token (invalidar el viejo, emitir uno nuevo)
+  db.prepare("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?").run(row.id);
+  const newRefreshToken = issueRefreshToken(user.id);
+  const newToken        = signToken(user);
+
+  res.json({ token: newToken, refreshToken: newRefreshToken });
+});
+
 // ── POST /api/auth/logout ─────────────────────────────────────────────────────
 
 router.post("/logout", (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (refreshToken) {
+    try { db.prepare("UPDATE refresh_tokens SET revoked = 1 WHERE token = ?").run(refreshToken); }
+    catch (_) {}
+  }
   res.json({ ok: true });
 });
 

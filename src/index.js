@@ -75,10 +75,10 @@ app.use(express.json({ limit: "10mb" }));
 // Auth endpoints — límite estricto para prevenir brute force
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 20,                   // 20 intentos por IP
+  max: 5,                    // 5 intentos por IP — brute force protection
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Demasiados intentos. Esperá 15 minutos e intentá de nuevo." },
+  message: { error: "Demasiados intentos fallidos. Esperá 15 minutos e intentá de nuevo." },
 });
 
 // API general — límite moderado
