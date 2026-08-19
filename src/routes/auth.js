@@ -328,9 +328,106 @@ router.post("/accept-invite/:token", async (req, res) => {
 router.get("/team", requireJWT, (req, res) => {
   try {
     const members = db.prepare(
-      "SELECT id, nombre, email, rol, activo, creado_en FROM users WHERE empresa_id = ? ORDER BY creado_en ASC"
+      "SELECT id, nombre, email, username, rol, activo, creado_en FROM users WHERE empresa_id = ? ORDER BY creado_en ASC"
     ).all(req.jwtPayload.empresaId);
     res.json({ members });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno." });
+  }
+});
+
+// ── POST /api/auth/create-user — admin crea un usuario bajo su empresa ────────
+// Solo admins y superadmins pueden crear usuarios dentro de su empresa.
+
+router.post("/create-user", requireJWT, async (req, res) => {
+  try {
+    const { rol: rolAdmin, empresaId, email: adminEmail } = req.jwtPayload;
+    if (!["admin", "superadmin"].includes(rolAdmin)) {
+      return res.status(403).json({ error: "Solo administradores pueden crear usuarios." });
+    }
+
+    const { nombre, username, password, rol = "colaborador" } = req.body || {};
+    if (!nombre?.trim()) return res.status(400).json({ error: "El nombre es requerido." });
+    if (!username?.trim()) return res.status(400).json({ error: "El usuario es requerido." });
+    if (!password || password.length < 6)
+      return res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres." });
+
+    const usernameLow = username.trim().toLowerCase().replace(/\s+/g, "_");
+
+    // Verificar que el username no exista en toda la plataforma
+    const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(usernameLow);
+    if (existing) return res.status(409).json({ error: `El usuario "${usernameLow}" ya existe. Elige otro.` });
+
+    const hash = await bcrypt.hash(password, 10);
+    const id   = uuidv4();
+
+    // Obtener empresa_nombre del admin
+    const adminUser = db.prepare("SELECT empresa_nombre FROM users WHERE id = ?").get(req.jwtPayload.sub);
+    const empresa_nombre = adminUser?.empresa_nombre || "";
+
+    db.prepare(`
+      INSERT INTO users (id, nombre, email, username, password_hash, empresa_id, empresa_nombre, rol, plan, activo, creado_en)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'activo', 1, datetime('now'))
+    `).run(id, nombre.trim(), `${usernameLow}@interno.${empresaId}`, usernameLow, hash, empresaId, empresa_nombre, rol);
+
+    res.json({
+      ok: true,
+      user: { id, nombre: nombre.trim(), username: usernameLow, rol, activo: true }
+    });
+  } catch (err) {
+    console.error("[auth/create-user]", err);
+    res.status(500).json({ error: "Error interno al crear el usuario." });
+  }
+});
+
+// ── PUT /api/auth/update-user/:id — admin actualiza usuario de su empresa ─────
+
+router.put("/update-user/:id", requireJWT, async (req, res) => {
+  try {
+    const { rol: rolAdmin, empresaId } = req.jwtPayload;
+    if (!["admin", "superadmin"].includes(rolAdmin)) {
+      return res.status(403).json({ error: "Sin permiso." });
+    }
+
+    const target = db.prepare("SELECT * FROM users WHERE id = ? AND empresa_id = ?").get(req.params.id, empresaId);
+    if (!target) return res.status(404).json({ error: "Usuario no encontrado." });
+
+    const { nombre, password, rol, activo } = req.body || {};
+    const updates = [];
+    const values  = [];
+
+    if (nombre?.trim())          { updates.push("nombre = ?");        values.push(nombre.trim()); }
+    if (rol)                     { updates.push("rol = ?");           values.push(rol); }
+    if (typeof activo === "boolean") { updates.push("activo = ?");   values.push(activo ? 1 : 0); }
+    if (password && password.length >= 6) {
+      updates.push("password_hash = ?");
+      values.push(await bcrypt.hash(password, 10));
+    }
+
+    if (updates.length === 0) return res.json({ ok: true, message: "Sin cambios." });
+    values.push(req.params.id);
+    db.prepare(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`).run(...values);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno." });
+  }
+});
+
+// ── DELETE /api/auth/delete-user/:id — admin elimina usuario de su empresa ────
+
+router.delete("/delete-user/:id", requireJWT, (req, res) => {
+  try {
+    const { rol: rolAdmin, empresaId, sub } = req.jwtPayload;
+    if (!["admin", "superadmin"].includes(rolAdmin)) {
+      return res.status(403).json({ error: "Sin permiso." });
+    }
+    if (req.params.id === sub) return res.status(400).json({ error: "No puedes eliminarte a ti mismo." });
+
+    const target = db.prepare("SELECT id FROM users WHERE id = ? AND empresa_id = ?").get(req.params.id, empresaId);
+    if (!target) return res.status(404).json({ error: "Usuario no encontrado." });
+
+    db.prepare("DELETE FROM users WHERE id = ?").run(req.params.id);
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: "Error interno." });
   }
