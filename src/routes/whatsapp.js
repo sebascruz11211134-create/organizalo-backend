@@ -342,6 +342,140 @@ function dentroDelHorario(rockyConfig) {
   return minutos >= minInicio && minutos < minFin;
 }
 
+// ── Herramientas de Rocky ─────────────────────────────────────────────────────
+
+function ejecutarConsultarInventario(empresaId, nombre) {
+  try {
+    const row = getEmpresaDb(empresaId).prepare(
+      "SELECT valor FROM cloud_data WHERE clave = ?"
+    ).get("@finanzia/productos");
+    const lista = row?.valor ? JSON.parse(row.valor) : [];
+    const q = (nombre || "").toLowerCase();
+    const resultados = lista
+      .filter(p => p.nombre?.toLowerCase().includes(q))
+      .slice(0, 5)
+      .map(p => ({ nombre: p.nombre, stock: p.stock ?? "N/D", precio: p.precio ?? "N/D", unidad: p.unidad || "" }));
+    return resultados.length
+      ? { encontrados: resultados }
+      : { mensaje: "No se encontró ese producto en el inventario." };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function ejecutarCrearPedido(empresaId, from, clienteNombre, items, notas) {
+  try {
+    const edb = getEmpresaDb(empresaId);
+    const row = edb.prepare("SELECT valor FROM cloud_data WHERE clave = ?").get("@finanzia/pedidos");
+    const lista = row?.valor ? JSON.parse(row.valor) : [];
+    const telLimpio = String(from).replace(/[^0-9]/g, "").slice(-8);
+    const contacto  = (() => {
+      const cr = edb.prepare("SELECT valor FROM cloud_data WHERE clave = ?").get("@finanzia/contactos");
+      const cs = cr?.valor ? JSON.parse(cr.valor) : [];
+      return cs.find(c => String(c.tel || "").replace(/[^0-9]/g, "").endsWith(telLimpio));
+    })();
+    const nuevo = {
+      id:            `wa-${Date.now()}`,
+      clienteNombre: clienteNombre || contacto?.nombre || "Cliente WhatsApp",
+      clienteId:     contacto?.id || null,
+      estado:        "pendiente",
+      items:         Array.isArray(items) ? items : [{ nombre: String(items), cantidad: 1 }],
+      notas:         notas || "Pedido realizado por WhatsApp",
+      creadoEn:      new Date().toISOString(),
+      canalOrigen:   "whatsapp",
+    };
+    edb.prepare(
+      "INSERT INTO cloud_data (empresa_id,clave,valor,actualizado_en) VALUES(?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,actualizado_en=excluded.actualizado_en"
+    ).run(empresaId, "@finanzia/pedidos", JSON.stringify([nuevo, ...lista]), new Date().toISOString());
+    console.log(`[WA Tools] Pedido creado: ${nuevo.id} para ${nuevo.clienteNombre}`);
+    return { ok: true, pedidoId: nuevo.id, estado: "pendiente", mensaje: "Pedido registrado exitosamente." };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function ejecutarAgendarCita(empresaId, from, titulo, fecha, hora, clienteNombre, notas) {
+  try {
+    const edb = getEmpresaDb(empresaId);
+    const telLimpio = String(from).replace(/[^0-9]/g, "").slice(-8);
+    const contacto  = (() => {
+      const cr = edb.prepare("SELECT valor FROM cloud_data WHERE clave = ?").get("@finanzia/contactos");
+      const cs = cr?.valor ? JSON.parse(cr.valor) : [];
+      return cs.find(c => String(c.tel || "").replace(/[^0-9]/g, "").endsWith(telLimpio));
+    })();
+    const id = `wa-ev-${Date.now()}`;
+    edb.prepare(`
+      INSERT INTO eventos (id,empresa_id,titulo,descripcion,tipo,fecha,hora,todo_el_dia,cliente_id,cliente_nombre,completado,color,creado_en)
+      VALUES (?,?,?,?,?,?,?,0,?,?,0,'#10b981',?)
+    `).run(
+      id, empresaId, titulo || "Cita WhatsApp",
+      notas || "Cita agendada por WhatsApp", "cita",
+      fecha, hora || "09:00",
+      contacto?.id || null,
+      clienteNombre || contacto?.nombre || "Cliente WhatsApp",
+      new Date().toISOString()
+    );
+    console.log(`[WA Tools] Cita agendada: ${titulo} el ${fecha}`);
+    return { ok: true, eventoId: id, fecha, hora: hora || "09:00", mensaje: "Cita agendada correctamente." };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+// Definición de tools para Claude
+const ROCKY_TOOLS = [
+  {
+    name: "consultar_inventario",
+    description: "Busca un producto en el inventario del negocio para informar disponibilidad y precio al cliente.",
+    input_schema: {
+      type: "object",
+      properties: {
+        nombre: { type: "string", description: "Nombre o parte del nombre del producto a buscar." }
+      },
+      required: ["nombre"]
+    }
+  },
+  {
+    name: "crear_pedido",
+    description: "Registra un pedido del cliente en el sistema. Usá cuando el cliente confirme que quiere pedir algo.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cliente_nombre: { type: "string", description: "Nombre del cliente." },
+        items: {
+          type: "array",
+          description: "Lista de productos pedidos.",
+          items: {
+            type: "object",
+            properties: {
+              nombre:   { type: "string" },
+              cantidad: { type: "number" }
+            },
+            required: ["nombre", "cantidad"]
+          }
+        },
+        notas: { type: "string", description: "Notas adicionales del pedido." }
+      },
+      required: ["items"]
+    }
+  },
+  {
+    name: "agendar_cita",
+    description: "Agenda una cita o turno para el cliente en el calendario del negocio.",
+    input_schema: {
+      type: "object",
+      properties: {
+        titulo:         { type: "string", description: "Descripción de la cita." },
+        fecha:          { type: "string", description: "Fecha en formato YYYY-MM-DD." },
+        hora:           { type: "string", description: "Hora en formato HH:MM." },
+        cliente_nombre: { type: "string", description: "Nombre del cliente." },
+        notas:          { type: "string", description: "Notas adicionales." }
+      },
+      required: ["titulo", "fecha"]
+    }
+  }
+];
+
 // ── Rocky IA para WhatsApp ────────────────────────────────────────────────────
 async function consultarRockyWA(mensajeCliente, from, empresaId) {
   if (!config.anthropicApiKey) return null;
@@ -351,25 +485,18 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
   let settingsEmpresa = {};
   try {
     const edb = getEmpresaDb(empresaId);
-    const rcRow = edb.prepare(
-      "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_config'"
-    ).get(empresaId);
+    const rcRow = edb.prepare("SELECT valor FROM cloud_data WHERE clave = 'rocky_config'").get();
     rockyConfig = rcRow ? JSON.parse(rcRow.valor) : {};
-
-    const stRow = edb.prepare(
-      "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'settings'"
-    ).get(empresaId);
+    const stRow = edb.prepare("SELECT valor FROM cloud_data WHERE clave = 'settings'").get();
     settingsEmpresa = stRow ? JSON.parse(stRow.valor) : {};
   } catch (_) {}
 
-  // Si Rocky no está activo, no responder
   if (rockyConfig.activo === false) return null;
 
   // Verificar horario de atención
   if (!dentroDelHorario(rockyConfig)) {
-    const msgFuera = rockyConfig?.mensajeFueraHorario ||
+    return rockyConfig?.mensajeFueraHorario ||
       `Gracias por escribirnos. Nuestro horario de atención es de ${rockyConfig.horarioInicio || "08:00"} a ${rockyConfig.horarioFin || "20:00"}. Te responderemos a la brevedad. 🙏`;
-    return msgFuera;
   }
 
   const nombreEmpresa = settingsEmpresa?.empresa || rockyConfig?.nombreEmpresa || "la empresa";
@@ -377,42 +504,80 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
   const instrucciones = rockyConfig?.instrucciones || "";
 
   const systemPrompt = [
-    `Sos Rocky, el asistente de WhatsApp de ${nombreEmpresa}.`,
-    `Tipo de negocio: ${tipoNegocio}.`,
+    `Sos Rocky, el asistente de WhatsApp de ${nombreEmpresa}. Tipo de negocio: ${tipoNegocio}.`,
     instrucciones ? `Instrucciones especiales: ${instrucciones}` : "",
-    `Respondé en español, de forma amable, concisa y profesional.`,
-    `Tenés memoria de la conversación — respondé con contexto de los mensajes anteriores.`,
-    `Si el cliente quiere hacer un pedido, cita o consulta específica, indicale que un asesor lo contactará pronto.`,
-    `No inventes precios ni disponibilidad. Máximo 3 oraciones por respuesta.`,
+    `Respondé en español, amable y conciso. Tenés memoria de la conversación.`,
+    `Podés consultar el inventario, registrar pedidos y agendar citas usando las herramientas disponibles.`,
+    `Siempre confirmá con el cliente antes de crear un pedido o cita. Máximo 3 oraciones por respuesta.`,
+    `No inventes precios ni stock — consultá el inventario primero.`,
   ].filter(Boolean).join(" ");
 
-  // Cargar historial y armar mensajes para Claude
   const historial = obtenerHistorial(empresaId, from);
-  const mensajesParaClaude = [
-    ...historial.slice(-10), // últimos 10 para no exceder tokens
+  const mensajes  = [
+    ...historial.slice(-10),
     { role: "user", content: mensajeCliente },
   ];
 
   try {
-    const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
-    const res = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 300,
-      system: systemPrompt,
-      messages: mensajesParaClaude,
-    });
-    const respuesta = res.content?.[0]?.text || null;
+    const anthropic  = new Anthropic({ apiKey: config.anthropicApiKey });
+    let respuestaFinal = null;
 
-    // Guardar en historial
-    if (respuesta) {
+    // Agentic loop: hasta 4 rondas de tool use
+    for (let ronda = 0; ronda < 4; ronda++) {
+      const res = await anthropic.messages.create({
+        model:      "claude-haiku-4-5-20251001",
+        max_tokens: 600,
+        system:     systemPrompt,
+        tools:      ROCKY_TOOLS,
+        messages:   mensajes,
+      });
+
+      // Agregar respuesta del asistente al hilo
+      mensajes.push({ role: "assistant", content: res.content });
+
+      if (res.stop_reason === "end_turn") {
+        // Extraer texto final
+        const bloque = res.content.find(b => b.type === "text");
+        respuestaFinal = bloque?.text || null;
+        break;
+      }
+
+      if (res.stop_reason === "tool_use") {
+        // Ejecutar cada tool call y agregar resultados
+        const toolResults = [];
+        for (const bloque of res.content) {
+          if (bloque.type !== "tool_use") continue;
+          let resultado;
+          const inp = bloque.input || {};
+          if (bloque.name === "consultar_inventario") {
+            resultado = ejecutarConsultarInventario(empresaId, inp.nombre);
+          } else if (bloque.name === "crear_pedido") {
+            resultado = ejecutarCrearPedido(empresaId, from, inp.cliente_nombre, inp.items, inp.notas);
+          } else if (bloque.name === "agendar_cita") {
+            resultado = ejecutarAgendarCita(empresaId, from, inp.titulo, inp.fecha, inp.hora, inp.cliente_nombre, inp.notas);
+          } else {
+            resultado = { error: "Herramienta desconocida" };
+          }
+          toolResults.push({ type: "tool_result", tool_use_id: bloque.id, content: JSON.stringify(resultado) });
+        }
+        mensajes.push({ role: "user", content: toolResults });
+        continue;
+      }
+
+      // Cualquier otro stop_reason — salir
+      break;
+    }
+
+    // Guardar historial (solo user + última respuesta de texto)
+    if (respuestaFinal) {
       guardarHistorial(empresaId, from, [
         ...historial,
         { role: "user",      content: mensajeCliente },
-        { role: "assistant", content: respuesta },
+        { role: "assistant", content: respuestaFinal },
       ]);
     }
 
-    return respuesta;
+    return respuestaFinal;
   } catch (e) {
     console.error("[WhatsApp Rocky] Error Claude:", e.message);
     return null;
