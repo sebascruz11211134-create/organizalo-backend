@@ -71,6 +71,9 @@ app.use(cors({
 
 app.use(express.json({ limit: "10mb" }));
 
+// Railway / proxies — necesario para que express-rate-limit funcione correctamente
+app.set("trust proxy", 1);
+
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 // Auth endpoints — límite estricto para prevenir brute force
 const authLimiter = rateLimit({
@@ -78,6 +81,7 @@ const authLimiter = rateLimit({
   max: 5,                    // 5 intentos por IP — brute force protection
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { trustProxy: false }, // desactivar validación de proxy en Railway
   message: { error: "Demasiados intentos fallidos. Esperá 15 minutos e intentá de nuevo." },
 });
 
@@ -87,6 +91,7 @@ const apiLimiter = rateLimit({
   max: 300,                  // 300 requests/min por IP
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { trustProxy: false }, // desactivar validación de proxy en Railway
   message: { error: "Demasiadas solicitudes. Intentá en un momento." },
 });
 
