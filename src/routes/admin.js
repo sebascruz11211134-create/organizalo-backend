@@ -12,7 +12,7 @@
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
-const { db } = require("../db");
+const { db, getEmpresaDb } = require("../db");
 const config = require("../config");
 
 const router = express.Router();
@@ -230,9 +230,10 @@ router.get("/usuarios/:id/datos", ...auth, (req, res) => {
     if (!usuario) return res.status(404).json({ error: "Usuario no encontrado." });
     if (!usuario.empresa_id) return res.json({ claves: [], empresaId: null });
 
-    const filas = db.prepare(
-      "SELECT clave, valor, actualizado_en FROM cloud_data WHERE empresa_id = ? ORDER BY actualizado_en DESC"
-    ).all(usuario.empresa_id);
+    const edb = getEmpresaDb(usuario.empresa_id);
+    const filas = edb.prepare(
+      "SELECT clave, valor, actualizado_en FROM cloud_data ORDER BY actualizado_en DESC"
+    ).all();
 
     const claves = filas.map(f => {
       let conteo = null;
@@ -265,9 +266,9 @@ router.get("/usuarios/:id/datos/:clave", ...auth, (req, res) => {
     const usuario = db.prepare("SELECT empresa_id FROM users WHERE id = ?").get(req.params.id);
     if (!usuario?.empresa_id) return res.status(404).json({ error: "Usuario sin empresa." });
 
-    const fila = db.prepare(
-      "SELECT valor, actualizado_en FROM cloud_data WHERE empresa_id = ? AND clave = ?"
-    ).get(usuario.empresa_id, req.params.clave);
+    const fila = getEmpresaDb(usuario.empresa_id).prepare(
+      "SELECT valor, actualizado_en FROM cloud_data WHERE clave = ?"
+    ).get(req.params.clave);
 
     if (!fila) return res.status(404).json({ error: "Clave no encontrada." });
 
@@ -316,9 +317,9 @@ router.delete("/usuarios/:id/datos/:clave", ...auth, (req, res) => {
     const usuario = db.prepare("SELECT empresa_id FROM users WHERE id = ?").get(req.params.id);
     if (!usuario?.empresa_id) return res.status(404).json({ error: "Usuario sin empresa." });
 
-    const changes = db.prepare(
-      "DELETE FROM cloud_data WHERE empresa_id = ? AND clave = ?"
-    ).run(usuario.empresa_id, req.params.clave);
+    const changes = getEmpresaDb(usuario.empresa_id).prepare(
+      "DELETE FROM cloud_data WHERE clave = ?"
+    ).run(req.params.clave);
 
     if (changes.changes === 0) return res.status(404).json({ error: "Clave no encontrada." });
     res.json({ ok: true, mensaje: `Clave '${req.params.clave}' eliminada.` });
