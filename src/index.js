@@ -71,6 +71,8 @@ app.use(cors({
 
 app.use(express.json({ limit: "10mb" }));
 
+app.set("trust proxy", 1);
+
 // Railway / proxies — necesario para que express-rate-limit funcione correctamente
 app.set("trust proxy", 1);
 
