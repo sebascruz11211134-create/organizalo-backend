@@ -44,7 +44,57 @@ function getQRCode() {
   catch { return null; }
 }
 
-function initWAClient() {
+// ── SqliteSessionStore — persiste la sesión WA en SQLite por empresa ─────────
+// Así la sesión sobrevive reinicios de Railway sin pedir QR de nuevo.
+class SqliteSessionStore {
+  constructor(empresaId) { this.empresaId = empresaId; }
+
+  async sessionExists({ session }) {
+    try {
+      const row = getEmpresaDb(this.empresaId)
+        .prepare("SELECT clave FROM cloud_data WHERE empresa_id=? AND clave=?")
+        .get(this.empresaId, `wa_session_${session}`);
+      return !!row;
+    } catch { return false; }
+  }
+
+  async save({ session }) {
+    const fs   = require("fs");
+    const path = require("path");
+    try {
+      const zipPath = path.resolve(`.wwebjs_auth/RemoteAuth-${session}.zip`);
+      if (!fs.existsSync(zipPath)) return;
+      const data = fs.readFileSync(zipPath).toString("base64");
+      getEmpresaDb(this.empresaId)
+        .prepare("INSERT INTO cloud_data (empresa_id,clave,valor,actualizado_en) VALUES(?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,actualizado_en=excluded.actualizado_en")
+        .run(this.empresaId, `wa_session_${session}`, data, new Date().toISOString());
+      console.log(`[WA] ✓ Sesión guardada en SQLite (empresa ${this.empresaId})`);
+    } catch (e) { console.error("[WA] Error guardando sesión:", e.message); }
+  }
+
+  async extract({ session, path: destPath }) {
+    try {
+      const fs  = require("fs");
+      const row = getEmpresaDb(this.empresaId)
+        .prepare("SELECT valor FROM cloud_data WHERE empresa_id=? AND clave=?")
+        .get(this.empresaId, `wa_session_${session}`);
+      if (row?.valor) {
+        fs.writeFileSync(destPath, Buffer.from(row.valor, "base64"));
+        console.log(`[WA] ✓ Sesión restaurada desde SQLite (empresa ${this.empresaId})`);
+      }
+    } catch (e) { console.error("[WA] Error extrayendo sesión:", e.message); }
+  }
+
+  async delete({ session }) {
+    try {
+      getEmpresaDb(this.empresaId)
+        .prepare("DELETE FROM cloud_data WHERE empresa_id=? AND clave=?")
+        .run(this.empresaId, `wa_session_${session}`);
+    } catch {}
+  }
+}
+
+function initWAClient(empresaId) {
   const mod = getWWebJS();
   if (!mod) {
     console.log("[WhatsApp] whatsapp-web.js no instalado. Corré: npm install whatsapp-web.js qrcode");
@@ -52,7 +102,10 @@ function initWAClient() {
   }
   if (waInitializing) return;
 
-  const { Client, LocalAuth } = mod;
+  // Actualizar empresa activa si se pasó una
+  if (empresaId) waEmpresaId = empresaId;
+
+  const { Client, RemoteAuth } = mod;
 
   if (waClient) {
     waClient.destroy().catch(() => {});
@@ -64,10 +117,6 @@ function initWAClient() {
   waQRRaw   = null;
   waReady   = false;
 
-  // Ruta del navegador según entorno:
-  // - CHROME_PATH env var (Docker/Railway → /usr/bin/chromium)
-  // - macOS dev → Google Chrome instalado
-  // - Linux sin env var → intentar chromium o chrome
   const execPath = process.env.CHROME_PATH
     || (process.platform === "darwin"
         ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -77,16 +126,15 @@ function initWAClient() {
             catch { return "/usr/bin/chromium"; }
           })());
 
-  // Limpiar singleton locks de Chrome (quedan si la sesión anterior terminó mal)
-  const fs   = require("fs");
-  const path = require("path");
-  const sessionDir = path.resolve(__dirname, "../../.wwebjs_auth/session");
-  ["SingletonLock", "SingletonCookie", "SingletonSocket"].forEach(f => {
-    try { fs.unlinkSync(path.join(sessionDir, f)); } catch { /* no existía */ }
-  });
+  const sessionId = waEmpresaId || "default";
 
   waClient = new Client({
-    authStrategy: new LocalAuth({ dataPath: "./.wwebjs_auth" }),
+    authStrategy: new RemoteAuth({
+      clientId: sessionId,
+      dataPath: "./.wwebjs_auth",
+      store: new SqliteSessionStore(sessionId),
+      backupSyncIntervalMs: 300000, // backup cada 5 min
+    }),
     puppeteer: {
       executablePath: execPath,
       headless: true,
@@ -117,12 +165,14 @@ function initWAClient() {
     console.log("[WhatsApp] ¡Conectado!");
   });
 
+  waClient.on("remote_session_saved", () => {
+    console.log("[WhatsApp] Sesión sincronizada con SQLite ✓");
+  });
+
   // ── Auto-respuesta con Rocky IA ──────────────────────────────────────────
   waClient.on("message", async (msg) => {
-    // Ignorar grupos, mensajes propios y estado
     if (msg.isGroupMsg || msg.fromMe || msg.from === "status@broadcast") return;
-    if (!waEmpresaId) return; // no hay empresa configurada
-
+    if (!waEmpresaId) return;
     try {
       const respuesta = await consultarRockyWA(msg.body, msg.from, waEmpresaId);
       if (respuesta) await msg.reply(respuesta);
@@ -135,12 +185,15 @@ function initWAClient() {
     waStatus = "disconnected";
     waReady  = false;
     waInitializing = false;
-    console.log("[WhatsApp] Auth fallida — limpiando sesión y reiniciando en 3s");
-    // Limpiar sesión corrupta para forzar nuevo QR
-    const fs2   = require("fs");
-    const path2 = require("path");
-    try { fs2.rmSync(path2.resolve(__dirname, "../../.wwebjs_auth"), { recursive: true, force: true }); } catch {}
-    setTimeout(initWAClient, 3000);
+    console.log("[WhatsApp] Auth fallida — se necesita nuevo QR");
+    // Borrar sesión corrupta del SQLite
+    if (waEmpresaId) {
+      try {
+        getEmpresaDb(waEmpresaId)
+          .prepare("DELETE FROM cloud_data WHERE empresa_id=? AND clave=?")
+          .run(waEmpresaId, `wa_session_${waEmpresaId}`);
+      } catch {}
+    }
   });
 
   waClient.on("disconnected", () => {
@@ -158,8 +211,8 @@ function initWAClient() {
   });
 }
 
-// Auto-inicializar si el paquete está instalado
-if (getWWebJS()) initWAClient();
+// No auto-inicializar en startup — se inicia cuando el usuario visita /qr
+// La sesión se restaura automáticamente desde SQLite sin pedir QR.
 
 // ── Rocky IA para WhatsApp ────────────────────────────────────────────────────
 async function consultarRockyWA(mensajeCliente, from, empresaId) {
@@ -252,10 +305,11 @@ router.get("/qr", requireJWT, async (req, res) => {
   if (waStatus === "open") return res.json({ ok: true, yaConectado: true });
 
   // Guardar empresa que inició la sesión
-  if (req.jwtPayload?.empresaId) waEmpresaId = req.jwtPayload.empresaId;
+  const eid = req.jwtPayload?.empresaId;
+  if (eid) waEmpresaId = eid;
 
-  // Si está desconectado y sin cliente, iniciar
-  if (!waClient || waStatus === "disconnected") initWAClient();
+  // Si está desconectado y sin cliente, iniciar (restaura sesión desde SQLite si existe)
+  if (!waClient || waStatus === "disconnected") initWAClient(eid);
 
   // Si el QR ya está listo, devolverlo inmediatamente
   if (waQRRaw) {
@@ -308,7 +362,7 @@ router.post("/send-reminder", requireJWT, async (req, res) => {
 // ── POST /api/whatsapp/reconectar ─────────────────────────────────────────────
 router.post("/reconectar", requireJWT, (req, res) => {
   if (!getWWebJS()) return res.status(500).json({ ok: false, error: "whatsapp-web.js no instalado" });
-  initWAClient();
+  initWAClient(req.jwtPayload?.empresaId);
   res.json({ ok: true, mensaje: "Reconectando..." });
 });
 
