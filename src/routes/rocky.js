@@ -20,7 +20,7 @@ const express   = require("express");
 const jwt       = require("jsonwebtoken");
 const Anthropic = require("@anthropic-ai/sdk");
 const { v4: uuidv4 } = require("uuid");
-const { db }    = require("../db");
+const { getEmpresaDb } = require("../db");
 const config    = require("../config");
 const { registerUsage } = require("../middleware/apiQuota");
 
@@ -71,7 +71,8 @@ function twimlSay(mensaje) {
 
 /** Carga configuración del agente por empresa */
 function cargarConfigRocky(empresaId) {
-  const row = db.prepare(
+  const edb = getEmpresaDb(empresaId);
+  const row = edb.prepare(
     "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_config'"
   ).get(empresaId);
   return parse(row?.valor) || {
@@ -85,13 +86,14 @@ function cargarConfigRocky(empresaId) {
 
 /** Carga datos del menú o servicios de la empresa */
 function cargarContextoEmpresa(empresaId, tipoNegocio) {
+  const edb = getEmpresaDb(empresaId);
   const datosClaves = tipoNegocio === "restaurante"
     ? ["productos_catalogo", "inventario", "settings"]
     : tipoNegocio === "servicios"
       ? ["settings", "empleados"]
       : ["settings"];
 
-  const rows = db.prepare(
+  const rows = edb.prepare(
     `SELECT clave, valor FROM cloud_data WHERE empresa_id = ? AND clave IN (${datosClaves.map(() => "?").join(",")})`
   ).all(empresaId, ...datosClaves);
 
@@ -102,14 +104,15 @@ function cargarContextoEmpresa(empresaId, tipoNegocio) {
 
 /** Guarda llamada en el historial */
 function guardarLlamada(empresaId, llamada) {
-  const histRow = db.prepare(
+  const edb = getEmpresaDb(empresaId);
+  const histRow = edb.prepare(
     "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_historial'"
   ).get(empresaId);
   const historial = parse(histRow?.valor) || [];
   historial.unshift({ ...llamada, id: uuidv4(), fecha: ahora() });
   // Mantener máximo 200 llamadas
   const recorte = historial.slice(0, 200);
-  db.prepare(
+  edb.prepare(
     "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(empresa_id,clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
   ).run(empresaId, "rocky_historial", JSON.stringify(recorte), ahora());
 }
@@ -271,7 +274,8 @@ INSTRUCCIONES:
 
     // Si se completó un pedido: crear en cloud_data
     if (accion === "PEDIDO") {
-      const pedidosRow = db.prepare(
+      const edb = getEmpresaDb(empresaId);
+      const pedidosRow = edb.prepare(
         "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'pedidos'"
       ).get(empresaId);
       const pedidos = parse(pedidosRow?.valor) || [];
@@ -286,14 +290,15 @@ INSTRUCCIONES:
         creadoEn: ahora(),
       };
       pedidos.push(nuevoPedido);
-      db.prepare(
+      edb.prepare(
         "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(empresa_id,clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
       ).run(empresaId, "pedidos", JSON.stringify(pedidos), ahora());
     }
 
     // Si se agendó una cita: crear evento en tabla eventos
     if (accion === "CITA") {
-      db.prepare(`
+      const edb = getEmpresaDb(empresaId);
+      edb.prepare(`
         INSERT INTO eventos (id, empresa_id, titulo, descripcion, tipo, fecha, hora, todo_el_dia, creado_en)
         VALUES (?, ?, ?, ?, 'cita', ?, ?, 0, ?)
       `).run(
@@ -301,7 +306,7 @@ INSTRUCCIONES:
         empresaId,
         `Cita (Rocky): ${telefono}`,
         resumen,
-        hoy(), // Fecha real se extrae si Claude la menciona
+        hoy(),
         "09:00",
         ahora()
       );
@@ -338,7 +343,8 @@ router.post("/config", requireJWT, (req, res) => {
   try {
     const { empresaId } = req.jwtPayload;
     const configData = req.body;
-    db.prepare(
+    const edb = getEmpresaDb(empresaId);
+    edb.prepare(
       "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(empresa_id,clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
     ).run(empresaId, "rocky_config", JSON.stringify(configData), ahora());
     res.json({ ok: true });
@@ -363,7 +369,8 @@ router.get("/config", requireJWT, (req, res) => {
 router.get("/historial", requireJWT, (req, res) => {
   try {
     const { empresaId } = req.jwtPayload;
-    const row = db.prepare(
+    const edb = getEmpresaDb(empresaId);
+    const row = edb.prepare(
       "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_historial'"
     ).get(empresaId);
     const historial = parse(row?.valor) || [];

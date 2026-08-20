@@ -9,7 +9,7 @@ const express   = require("express");
 const jwt       = require("jsonwebtoken");
 const Anthropic = require("@anthropic-ai/sdk");
 const config    = require("../config");
-const { db }    = require("../db");
+const { getEmpresaDb } = require("../db");
 
 const router = express.Router();
 
@@ -169,12 +169,13 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
   let rockyConfig = {};
   let settingsEmpresa = {};
   try {
-    const rcRow = db.prepare(
+    const edb = getEmpresaDb(empresaId);
+    const rcRow = edb.prepare(
       "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_config'"
     ).get(empresaId);
     rockyConfig = rcRow ? JSON.parse(rcRow.valor) : {};
 
-    const stRow = db.prepare(
+    const stRow = edb.prepare(
       "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'settings'"
     ).get(empresaId);
     settingsEmpresa = stRow ? JSON.parse(stRow.valor) : {};
