@@ -5,10 +5,11 @@
  * Instalación requerida: npm install whatsapp-web.js qrcode
  */
 
-const express = require("express");
-const jwt     = require("jsonwebtoken");
-const config  = require("../config");
-const { db }  = require("../db");
+const express   = require("express");
+const jwt       = require("jsonwebtoken");
+const Anthropic = require("@anthropic-ai/sdk");
+const config    = require("../config");
+const { db }    = require("../db");
 
 const router = express.Router();
 
@@ -26,11 +27,12 @@ function requireJWT(req, res, next) {
 }
 
 // ── Estado global del cliente WhatsApp ───────────────────────────────────────
-let waClient  = null;
-let waQRRaw   = null;   // string QR raw de WhatsApp
-let waStatus  = "disconnected";
-let waReady   = false;
+let waClient     = null;
+let waQRRaw      = null;   // string QR raw de WhatsApp
+let waStatus     = "disconnected";
+let waReady      = false;
 let waInitializing = false;
+let waEmpresaId  = null;   // empresa que inició la conexión
 
 function getWWebJS() {
   try { return require("whatsapp-web.js"); }
@@ -115,6 +117,20 @@ function initWAClient() {
     console.log("[WhatsApp] ¡Conectado!");
   });
 
+  // ── Auto-respuesta con Rocky IA ──────────────────────────────────────────
+  waClient.on("message", async (msg) => {
+    // Ignorar grupos, mensajes propios y estado
+    if (msg.isGroupMsg || msg.fromMe || msg.from === "status@broadcast") return;
+    if (!waEmpresaId) return; // no hay empresa configurada
+
+    try {
+      const respuesta = await consultarRockyWA(msg.body, msg.from, waEmpresaId);
+      if (respuesta) await msg.reply(respuesta);
+    } catch (e) {
+      console.error("[WhatsApp] Error en auto-reply:", e.message);
+    }
+  });
+
   waClient.on("auth_failure", () => {
     waStatus = "disconnected";
     waReady  = false;
@@ -144,6 +160,56 @@ function initWAClient() {
 
 // Auto-inicializar si el paquete está instalado
 if (getWWebJS()) initWAClient();
+
+// ── Rocky IA para WhatsApp ────────────────────────────────────────────────────
+async function consultarRockyWA(mensajeCliente, from, empresaId) {
+  if (!config.anthropicApiKey) return null;
+
+  // Cargar config de Rocky y datos de la empresa
+  let rockyConfig = {};
+  let settingsEmpresa = {};
+  try {
+    const rcRow = db.prepare(
+      "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_config'"
+    ).get(empresaId);
+    rockyConfig = rcRow ? JSON.parse(rcRow.valor) : {};
+
+    const stRow = db.prepare(
+      "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'settings'"
+    ).get(empresaId);
+    settingsEmpresa = stRow ? JSON.parse(stRow.valor) : {};
+  } catch (_) {}
+
+  // Si Rocky no está activo, no responder
+  if (rockyConfig.activo === false) return null;
+
+  const nombreEmpresa = settingsEmpresa?.empresa || rockyConfig?.nombreEmpresa || "la empresa";
+  const tipoNegocio   = rockyConfig?.tipoNegocio || "general";
+  const instrucciones = rockyConfig?.instrucciones || "";
+
+  const systemPrompt = [
+    `Sos Rocky, el asistente de WhatsApp de ${nombreEmpresa}.`,
+    `Tipo de negocio: ${tipoNegocio}.`,
+    instrucciones ? `Instrucciones especiales: ${instrucciones}` : "",
+    `Respondé en español, de forma amable, concisa y profesional.`,
+    `Si el cliente quiere hacer un pedido, cita o consulta específica, indicale que un asesor lo contactará pronto.`,
+    `No inventes precios ni disponibilidad. Máximo 3 oraciones por respuesta.`,
+  ].filter(Boolean).join(" ");
+
+  try {
+    const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
+    const res = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 300,
+      system: systemPrompt,
+      messages: [{ role: "user", content: mensajeCliente }],
+    });
+    return res.content?.[0]?.text || null;
+  } catch (e) {
+    console.error("[WhatsApp Rocky] Error Claude:", e.message);
+    return null;
+  }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function formatPhone(tel) {
@@ -183,6 +249,9 @@ router.get("/qr", requireJWT, async (req, res) => {
 
   // Si ya está conectado, avisamos
   if (waStatus === "open") return res.json({ ok: true, yaConectado: true });
+
+  // Guardar empresa que inició la sesión
+  if (req.jwtPayload?.empresaId) waEmpresaId = req.jwtPayload.empresaId;
 
   // Si está desconectado y sin cliente, iniciar
   if (!waClient || waStatus === "disconnected") initWAClient();
