@@ -234,6 +234,46 @@ if (getWWebJS()) {
   }
 }
 
+// ── Memoria de conversación por número ───────────────────────────────────────
+
+function claveConv(phone) {
+  // Clave SQLite segura: wa_conv_ + últimos 12 dígitos del número
+  return `wa_conv_${String(phone).replace(/[^0-9]/g, "").slice(-12)}`;
+}
+
+function obtenerHistorial(empresaId, phone) {
+  try {
+    const row = getEmpresaDb(empresaId).prepare(
+      "SELECT valor FROM cloud_data WHERE clave = ?"
+    ).get(claveConv(phone));
+    return row?.valor ? JSON.parse(row.valor) : [];
+  } catch { return []; }
+}
+
+function guardarHistorial(empresaId, phone, mensajes) {
+  try {
+    const recorte = mensajes.slice(-20); // guardar últimos 20, pasar 10 a Claude
+    getEmpresaDb(empresaId).prepare(
+      "INSERT INTO cloud_data (empresa_id,clave,valor,actualizado_en) VALUES(?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,actualizado_en=excluded.actualizado_en"
+    ).run(empresaId, claveConv(phone), JSON.stringify(recorte), new Date().toISOString());
+  } catch (e) { console.error("[WA] Error guardando historial:", e.message); }
+}
+
+// ── Horario de atención ───────────────────────────────────────────────────────
+
+function dentroDelHorario(rockyConfig) {
+  const inicio = rockyConfig?.horarioInicio; // "08:00"
+  const fin    = rockyConfig?.horarioFin;    // "20:00"
+  if (!inicio || !fin) return true; // sin horario configurado = siempre activo
+  const ahora = new Date();
+  const [hI, mI] = inicio.split(":").map(Number);
+  const [hF, mF] = fin.split(":").map(Number);
+  const minutos = ahora.getHours() * 60 + ahora.getMinutes();
+  const minInicio = hI * 60 + mI;
+  const minFin    = hF * 60 + mF;
+  return minutos >= minInicio && minutos < minFin;
+}
+
 // ── Rocky IA para WhatsApp ────────────────────────────────────────────────────
 async function consultarRockyWA(mensajeCliente, from, empresaId) {
   if (!config.anthropicApiKey) return null;
@@ -257,6 +297,13 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
   // Si Rocky no está activo, no responder
   if (rockyConfig.activo === false) return null;
 
+  // Verificar horario de atención
+  if (!dentroDelHorario(rockyConfig)) {
+    const msgFuera = rockyConfig?.mensajeFueraHorario ||
+      `Gracias por escribirnos. Nuestro horario de atención es de ${rockyConfig.horarioInicio || "08:00"} a ${rockyConfig.horarioFin || "20:00"}. Te responderemos a la brevedad. 🙏`;
+    return msgFuera;
+  }
+
   const nombreEmpresa = settingsEmpresa?.empresa || rockyConfig?.nombreEmpresa || "la empresa";
   const tipoNegocio   = rockyConfig?.tipoNegocio || "general";
   const instrucciones = rockyConfig?.instrucciones || "";
@@ -266,9 +313,17 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
     `Tipo de negocio: ${tipoNegocio}.`,
     instrucciones ? `Instrucciones especiales: ${instrucciones}` : "",
     `Respondé en español, de forma amable, concisa y profesional.`,
+    `Tenés memoria de la conversación — respondé con contexto de los mensajes anteriores.`,
     `Si el cliente quiere hacer un pedido, cita o consulta específica, indicale que un asesor lo contactará pronto.`,
     `No inventes precios ni disponibilidad. Máximo 3 oraciones por respuesta.`,
   ].filter(Boolean).join(" ");
+
+  // Cargar historial y armar mensajes para Claude
+  const historial = obtenerHistorial(empresaId, from);
+  const mensajesParaClaude = [
+    ...historial.slice(-10), // últimos 10 para no exceder tokens
+    { role: "user", content: mensajeCliente },
+  ];
 
   try {
     const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
@@ -276,9 +331,20 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
       model: "claude-haiku-4-5-20251001",
       max_tokens: 300,
       system: systemPrompt,
-      messages: [{ role: "user", content: mensajeCliente }],
+      messages: mensajesParaClaude,
     });
-    return res.content?.[0]?.text || null;
+    const respuesta = res.content?.[0]?.text || null;
+
+    // Guardar en historial
+    if (respuesta) {
+      guardarHistorial(empresaId, from, [
+        ...historial,
+        { role: "user",      content: mensajeCliente },
+        { role: "assistant", content: respuesta },
+      ]);
+    }
+
+    return respuesta;
   } catch (e) {
     console.error("[WhatsApp Rocky] Error Claude:", e.message);
     return null;
