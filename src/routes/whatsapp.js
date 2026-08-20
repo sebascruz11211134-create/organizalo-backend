@@ -188,6 +188,21 @@ function initWAClient(empresaId) {
     if (msg.isGroupMsg || msg.fromMe || msg.from === "status@broadcast") return;
     if (!waEmpresaId) return;
     try {
+      // Onboarding: crear contacto si es la primera vez que escribe
+      const { esNuevo } = onboardearContacto(waEmpresaId, msg.from);
+
+      // Si es nuevo y hay mensaje de bienvenida configurado, enviarlo primero
+      if (esNuevo) {
+        let rockyConfig = {};
+        try {
+          const r = getEmpresaDb(waEmpresaId).prepare("SELECT valor FROM cloud_data WHERE clave='rocky_config'").get();
+          if (r?.valor) rockyConfig = JSON.parse(r.valor);
+        } catch (_) {}
+        if (rockyConfig.mensajeBienvenida) {
+          await msg.reply(rockyConfig.mensajeBienvenida);
+        }
+      }
+
       const respuesta = await consultarRockyWA(msg.body, msg.from, waEmpresaId);
       if (respuesta) await msg.reply(respuesta);
     } catch (e) {
@@ -231,6 +246,59 @@ if (getWWebJS()) {
     initWAClient(empresaGuardada);
   } else {
     initWAClient();
+  }
+}
+
+// ── Onboarding: auto-crear contacto cuando escribe por primera vez ────────────
+
+const CLAVE_CONTACTOS = "@finanzia/contactos";
+
+function generarCodigoCli(lista) {
+  const nums = lista
+    .map(c => parseInt((c.codigoCliente || "").replace("CLI-", ""), 10))
+    .filter(n => !isNaN(n));
+  const siguiente = nums.length ? Math.max(...nums) + 1 : 1;
+  return `CLI-${String(siguiente).padStart(4, "0")}`;
+}
+
+function onboardearContacto(empresaId, phone) {
+  try {
+    const edb  = getEmpresaDb(empresaId);
+    const row  = edb.prepare("SELECT valor FROM cloud_data WHERE clave = ?").get(CLAVE_CONTACTOS);
+    const lista = row?.valor ? JSON.parse(row.valor) : [];
+
+    // Normalizar: quitar @c.us y no-dígitos para comparar
+    const telLimpio = String(phone).replace(/[^0-9]/g, "").slice(-8);
+    const yaExiste  = lista.some(c => String(c.tel || "").replace(/[^0-9]/g, "").endsWith(telLimpio));
+    if (yaExiste) return { esNuevo: false };
+
+    const id      = `wa-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const codigo  = generarCodigoCli(lista);
+    const tel     = phone.replace(/@c\.us$/i, "").replace(/[^0-9+]/g, "");
+    const nuevo   = {
+      id,
+      nombre:       tel,          // nombre provisional = número
+      tipo:         "cliente",
+      tel,
+      email:        "",
+      cedula:       "",
+      tipoCedula:   "fisico",
+      notas:        "Contacto creado automáticamente desde WhatsApp",
+      codigoCliente: codigo,
+      dias_credito: 0,
+      creadoEn:     new Date().toISOString(),
+    };
+
+    const listaActualizada = [nuevo, ...lista];
+    edb.prepare(
+      "INSERT INTO cloud_data (empresa_id,clave,valor,actualizado_en) VALUES(?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,actualizado_en=excluded.actualizado_en"
+    ).run(empresaId, CLAVE_CONTACTOS, JSON.stringify(listaActualizada), new Date().toISOString());
+
+    console.log(`[WA Onboarding] Nuevo contacto creado: ${tel} (${codigo})`);
+    return { esNuevo: true, contacto: nuevo };
+  } catch (e) {
+    console.error("[WA Onboarding] Error:", e.message);
+    return { esNuevo: false };
   }
 }
 
