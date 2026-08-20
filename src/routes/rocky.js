@@ -113,7 +113,7 @@ function guardarLlamada(empresaId, llamada) {
   // Mantener máximo 200 llamadas
   const recorte = historial.slice(0, 200);
   edb.prepare(
-    "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(empresa_id,clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
+    "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
   ).run(empresaId, "rocky_historial", JSON.stringify(recorte), ahora());
 }
 
@@ -291,7 +291,7 @@ INSTRUCCIONES:
       };
       pedidos.push(nuevoPedido);
       edb.prepare(
-        "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(empresa_id,clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
+        "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
       ).run(empresaId, "pedidos", JSON.stringify(pedidos), ahora());
     }
 
@@ -345,7 +345,7 @@ router.post("/config", requireJWT, (req, res) => {
     const configData = req.body;
     const edb = getEmpresaDb(empresaId);
     edb.prepare(
-      "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(empresa_id,clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
+      "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
     ).run(empresaId, "rocky_config", JSON.stringify(configData), ahora());
     res.json({ ok: true });
   } catch (err) {
