@@ -9,7 +9,7 @@ const express   = require("express");
 const jwt       = require("jsonwebtoken");
 const Anthropic = require("@anthropic-ai/sdk");
 const config    = require("../config");
-const { getEmpresaDb } = require("../db");
+const { db: sharedDb, getEmpresaDb } = require("../db");
 
 const router = express.Router();
 
@@ -48,6 +48,22 @@ function getQRCode() {
 // Guarda .wwebjs_auth como tar.gz en base64 dentro del SQLite de la empresa.
 // Así la sesión sobrevive reinicios/deploys de Railway sin re-escanear QR.
 
+// Persiste el empresaId activo en sharedDb para que sobreviva reinicios
+function guardarWAEmpresaId(empresaId) {
+  try {
+    sharedDb.prepare(
+      "INSERT INTO empresa_config (empresa_id, modulos_json, actualizado_en) VALUES ('__wa_active__', ?, ?) ON CONFLICT(empresa_id) DO UPDATE SET modulos_json=excluded.modulos_json, actualizado_en=excluded.actualizado_en"
+    ).run(empresaId, new Date().toISOString());
+  } catch (e) { console.error("[WA] Error guardando wa_empresa_id:", e.message); }
+}
+
+function leerWAEmpresaId() {
+  try {
+    const row = sharedDb.prepare("SELECT modulos_json FROM empresa_config WHERE empresa_id='__wa_active__'").get();
+    return row?.modulos_json || null;
+  } catch { return null; }
+}
+
 function backupSesionWA(empresaId) {
   if (!empresaId) return;
   const { execSync } = require("child_process");
@@ -61,6 +77,8 @@ function backupSesionWA(empresaId) {
     getEmpresaDb(empresaId).prepare(
       "INSERT INTO cloud_data (empresa_id,clave,valor,actualizado_en) VALUES(?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,actualizado_en=excluded.actualizado_en"
     ).run(empresaId, "wa_session_backup", data, new Date().toISOString());
+    // Guardar también qué empresa tiene WA activo para restaurar al reiniciar
+    guardarWAEmpresaId(empresaId);
     console.log("[WA] ✓ Sesión guardada en SQLite");
   } catch (e) { console.error("[WA] Error guardando sesión:", e.message); }
 }
@@ -204,8 +222,17 @@ function initWAClient(empresaId) {
   });
 }
 
-// Auto-inicializar si el paquete está instalado
-if (getWWebJS()) initWAClient();
+// Auto-inicializar si el paquete está instalado.
+// Intenta restaurar la empresa que tenía WA activo antes del reinicio.
+if (getWWebJS()) {
+  const empresaGuardada = leerWAEmpresaId();
+  if (empresaGuardada) {
+    console.log(`[WA] Auto-restaurando sesión para empresa: ${empresaGuardada}`);
+    initWAClient(empresaGuardada);
+  } else {
+    initWAClient();
+  }
+}
 
 // ── Rocky IA para WhatsApp ────────────────────────────────────────────────────
 async function consultarRockyWA(mensajeCliente, from, empresaId) {
