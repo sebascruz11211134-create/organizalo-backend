@@ -44,6 +44,18 @@ function sellarCreadoPor(claveExistente, nuevoArray, autor) {
   });
 }
 
+// ── GET /api/clouddata/ping — diagnóstico ─────────────────────────────────────
+router.get("/ping", requireJWT, (req, res) => {
+  const { empresaId, sub, email } = req.jwtPayload;
+  try {
+    const edb = getEmpresaDb(empresaId);
+    const count = edb.prepare("SELECT COUNT(*) as n FROM cloud_data").get();
+    res.json({ ok: true, empresaId, sub, email, rows: count.n });
+  } catch (err) {
+    res.status(500).json({ ok: false, empresaId, sub, email, error: err.message });
+  }
+});
+
 // ── POST /api/clouddata/push ──────────────────────────────────────────────────
 router.post("/push", requireJWT, (req, res) => {
   try {
@@ -51,6 +63,7 @@ router.post("/push", requireJWT, (req, res) => {
     const { data } = req.body || {};
     if (!data || typeof data !== "object") return res.status(400).json({ error: "data requerido." });
 
+    console.log(`[clouddata/push] empresaId=${empresaId} sub=${sub} claves=${Object.keys(data).length}`);
     const edb   = getEmpresaDb(empresaId);
     const now   = new Date().toISOString();
     const autor = { id: sub, email };
@@ -87,8 +100,8 @@ router.post("/push", requireJWT, (req, res) => {
 
     res.json({ ok: true, claves: Object.keys(data).length });
   } catch (err) {
-    console.error("[clouddata/push]", err);
-    res.status(500).json({ error: "Error interno." });
+    console.error("[clouddata/push]", err.stack || err.message || err);
+    res.status(500).json({ error: err.message || "Error interno." });
   }
 });
 
@@ -96,6 +109,7 @@ router.post("/push", requireJWT, (req, res) => {
 router.get("/pull", requireJWT, (req, res) => {
   try {
     const { empresaId } = req.jwtPayload;
+    console.log(`[clouddata/pull] empresaId=${empresaId}`);
     const edb = getEmpresaDb(empresaId);
     const rows = edb.prepare("SELECT clave, valor, actualizado_en FROM cloud_data").all();
     const data = {};
@@ -104,8 +118,8 @@ router.get("/pull", requireJWT, (req, res) => {
     }
     res.json({ data, total: rows.length });
   } catch (err) {
-    console.error("[clouddata/pull]", err);
-    res.status(500).json({ error: "Error interno." });
+    console.error("[clouddata/pull]", err.stack || err.message || err);
+    res.status(500).json({ error: err.message || "Error interno." });
   }
 });
 
