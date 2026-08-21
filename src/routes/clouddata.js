@@ -25,22 +25,54 @@ function requireJWT(req, res, next) {
   }
 }
 
+// Claves de arrays que requieren sello de auditoría por usuario
+const CLAVES_AUDITABLES = new Set([
+  "@finanzia/facturas",
+  "@finanzia/pedidos",
+  "@finanzia/cotizaciones",
+  "@finanzia/contactos",
+  "@finanzia/ordenesTrabajo",
+  "@finanzia/recibos",
+]);
+
+function sellarCreadoPor(claveExistente, nuevoArray, autor) {
+  if (!Array.isArray(nuevoArray)) return nuevoArray;
+  const idsExistentes = new Set((claveExistente || []).map(i => i?.id).filter(Boolean));
+  return nuevoArray.map(item => {
+    if (!item?.id || idsExistentes.has(item.id)) return item; // ítem existente — no tocar
+    return { ...item, creadoPor: autor };                      // ítem nuevo — sellar
+  });
+}
+
 // ── POST /api/clouddata/push ──────────────────────────────────────────────────
 router.post("/push", requireJWT, (req, res) => {
   try {
-    const { empresaId } = req.jwtPayload;
+    const { empresaId, sub, email } = req.jwtPayload;
     const { data } = req.body || {};
     if (!data || typeof data !== "object") return res.status(400).json({ error: "data requerido." });
 
-    const edb = getEmpresaDb(empresaId);
-    const now = new Date().toISOString();
+    const edb   = getEmpresaDb(empresaId);
+    const now   = new Date().toISOString();
+    const autor = { id: sub, email };
+
+    // Cargar datos actuales de las claves auditables (para comparar)
+    const existentes = {};
+    for (const clave of Object.keys(data)) {
+      if (!CLAVES_AUDITABLES.has(clave)) continue;
+      const row = edb.prepare("SELECT valor FROM cloud_data WHERE clave = ?").get(clave);
+      existentes[clave] = row?.valor ? JSON.parse(row.valor) : [];
+    }
+
     const insert = edb.prepare(`
       INSERT INTO cloud_data (clave, valor, actualizado_en)
       VALUES (?, ?, ?)
       ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor, actualizado_en = excluded.actualizado_en
     `);
 
-    for (const [clave, valor] of Object.entries(data)) {
+    for (let [clave, valor] of Object.entries(data)) {
+      if (CLAVES_AUDITABLES.has(clave)) {
+        valor = sellarCreadoPor(existentes[clave], valor, autor);
+      }
       insert.run(clave, JSON.stringify(valor), now);
     }
 
