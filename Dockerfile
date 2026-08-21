@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y \
 # Variables de entorno para puppeteer
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     CHROME_PATH=/usr/bin/chromium \
-    NODE_ENV=production
+    NODE_ENV=production \
+    NODE_OPTIONS="--max-old-space-size=384"
 
 WORKDIR /app
 
