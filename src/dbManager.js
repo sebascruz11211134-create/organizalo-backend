@@ -21,7 +21,7 @@ const sharedPath = config.dbPath;
 fs.mkdirSync(path.dirname(sharedPath), { recursive: true });
 
 const sharedDb = new DatabaseSync(sharedPath);
-sharedDb.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;");
+sharedDb.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA wal_autocheckpoint=200;");
 
 sharedDb.exec(`
   CREATE TABLE IF NOT EXISTS charla_config (
@@ -217,7 +217,7 @@ function getEmpresaDb(empresaId) {
 
   const dbPath = path.join(dataDir, `empresa_${empresaId}.sqlite`);
   const edb = new DatabaseSync(dbPath);
-  edb.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;");
+  edb.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA wal_autocheckpoint=200;");
   initEmpresaSchema(edb);
   empresaDbCache.set(empresaId, edb);
   return edb;
