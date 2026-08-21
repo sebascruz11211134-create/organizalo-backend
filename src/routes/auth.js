@@ -475,4 +475,21 @@ router.delete("/delete-user/:id", requireJWT, (req, res) => {
   }
 });
 
+// ── PUT /api/auth/perfil — actualizar nombre propio ──────────────────────────
+router.put("/perfil", requireJWT, (req, res) => {
+  try {
+    const { sub } = req.jwtPayload;
+    const { nombre } = req.body || {};
+    if (!nombre || typeof nombre !== "string" || nombre.trim().length < 2)
+      return res.status(400).json({ error: "Nombre inválido." });
+    db.prepare("UPDATE users SET nombre = ?, actualizado_en = ? WHERE id = ?")
+      .run(nombre.trim(), new Date().toISOString(), sub);
+    const row = db.prepare("SELECT * FROM users WHERE id = ?").get(sub);
+    res.json(buildUser(row));
+  } catch (err) {
+    console.error("[auth/perfil]", err);
+    res.status(500).json({ error: "Error interno." });
+  }
+});
+
 module.exports = router;
