@@ -310,4 +310,41 @@ async function responderConIA({ empresaId, canal, texto, io, edb }) {
   if (io) io.to(`empresa:${empresaId}:${canal}`).emit("mensaje", botMsg);
 }
 
+// ── GET /api/chat/no-leidos — total de mensajes no leídos en todos los canales ─
+router.get("/no-leidos", requireJWT, (req, res) => {
+  try {
+    const { userId, empresaId } = req.user;
+    const edb = getEmpresaDb(empresaId);
+    edb.prepare(`CREATE TABLE IF NOT EXISTS chat_leidos (
+      id TEXT PRIMARY KEY, canal TEXT NOT NULL, user_id TEXT NOT NULL,
+      leido_en TEXT NOT NULL, UNIQUE(canal, user_id)
+    )`).run();
+
+    const canales = [
+      "general", "facturación", "contabilidad", "inventario", "soporte",
+      // incluir DMs donde este usuario participa
+      ...edb.prepare(
+        "SELECT DISTINCT canal FROM chat_messages WHERE canal LIKE 'dm:%' AND canal LIKE ?"
+      ).all(`%${userId}%`).map(r => r.canal),
+    ];
+
+    let total = 0;
+    for (const canal of canales) {
+      const leidoEn = edb.prepare(
+        "SELECT leido_en FROM chat_leidos WHERE canal = ? AND user_id = ?"
+      ).get(canal, userId)?.leido_en || "1970-01-01";
+
+      const { n } = edb.prepare(
+        "SELECT COUNT(*) as n FROM chat_messages WHERE canal = ? AND user_id != ? AND creado_en > ?"
+      ).get(canal, userId, leidoEn);
+      total += n;
+    }
+
+    res.json({ total });
+  } catch (err) {
+    console.error("[chat/no-leidos]", err);
+    res.json({ total: 0 });
+  }
+});
+
 module.exports = router;
