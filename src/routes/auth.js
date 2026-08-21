@@ -482,9 +482,11 @@ router.put("/perfil", requireJWT, (req, res) => {
     const { nombre } = req.body || {};
     if (!nombre || typeof nombre !== "string" || nombre.trim().length < 2)
       return res.status(400).json({ error: "Nombre inválido." });
-    db.prepare("UPDATE users SET nombre = ?, actualizado_en = ? WHERE id = ?")
+    const info = db.prepare("UPDATE users SET nombre = ?, actualizado_en = ? WHERE id = ?")
       .run(nombre.trim(), new Date().toISOString(), sub);
+    console.log("[auth/perfil] UPDATE sub=", sub, "changes=", info?.changes ?? info);
     const row = db.prepare("SELECT * FROM users WHERE id = ?").get(sub);
+    if (!row) return res.status(404).json({ error: "Usuario no encontrado en DB." });
     res.json(userPublic(row));
   } catch (err) {
     console.error("[auth/perfil]", err);
