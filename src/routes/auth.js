@@ -213,8 +213,9 @@ router.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Usuario o contraseña incorrectos." });
 
-    const token        = signToken(user);
-    const refreshToken = issueRefreshToken(user.id);
+    const token = signToken(user);
+    let refreshToken = null;
+    try { refreshToken = issueRefreshToken(user.id); } catch (e) { console.error("[auth/login] refreshToken:", e.message); }
     res.json({ token, refreshToken, user: userPublic(user) });
   } catch (err) {
     console.error("[auth/login]", err);
@@ -485,7 +486,7 @@ router.put("/perfil", requireJWT, (req, res) => {
     db.prepare("UPDATE users SET nombre = ?, actualizado_en = ? WHERE id = ?")
       .run(nombre.trim(), new Date().toISOString(), sub);
     const row = db.prepare("SELECT * FROM users WHERE id = ?").get(sub);
-    res.json(buildUser(row));
+    res.json(userPublic(row));
   } catch (err) {
     console.error("[auth/perfil]", err);
     res.status(500).json({ error: "Error interno." });
