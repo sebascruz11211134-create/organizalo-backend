@@ -32,8 +32,9 @@ const server = http.createServer(app);
 // ── Socket.io ─────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
-    origin: config.allowedOrigins,
+    origin: config.allowedOrigins, // función dinámica
     methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 

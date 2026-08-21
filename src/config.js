@@ -5,16 +5,34 @@ function required(name, fallback = "") {
   return process.env[name] ?? fallback;
 }
 
-// Orígenes permitidos para CORS
+// Orígenes permitidos para CORS.
+// Acepta: lista de ALLOWED_ORIGINS + cualquier *.vercel.app + localhost.
 const ALLOWED_ORIGINS_RAW = process.env.ALLOWED_ORIGINS || "";
-const allowedOrigins = ALLOWED_ORIGINS_RAW
+const _explicitOrigins = ALLOWED_ORIGINS_RAW
   ? ALLOWED_ORIGINS_RAW.split(",").map(s => s.trim())
   : [
       "http://localhost:5173",
       "http://localhost:3000",
       "https://app.organizalo.ai",
       "https://organizalo.ai",
+      "https://app.monki.ai",
+      "https://monki.ai",
     ];
+
+// Función CORS dinámica: acepta orígenes explícitos + cualquier Vercel preview + localhost
+function allowedOrigins(origin, callback) {
+  // Sin origin (curl, mobile nativo, Postman) → permitir
+  if (!origin) return callback(null, true);
+  // Orígenes explícitos
+  if (_explicitOrigins.includes(origin)) return callback(null, true);
+  // Cualquier *.vercel.app (previews y producción)
+  if (/^https:\/\/[a-zA-Z0-9-]+(\.vercel\.app)$/.test(origin)) return callback(null, true);
+  // localhost en cualquier puerto
+  if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
+  // 127.0.0.1
+  if (/^https?:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return callback(null, true);
+  callback(new Error(`Origen no permitido por CORS: ${origin}`));
+}
 
 module.exports = {
   port: Number(process.env.PORT || 3001),
