@@ -70,7 +70,7 @@ function backupSesionWA(empresaId) {
   const fs = require("fs");
   const tmp = `/tmp/wa_bk_${empresaId}.tar.gz`;
   try {
-    execSync(`tar czf ${tmp} .wwebjs_auth 2>/dev/null || true`);
+    execSync(`tar czf ${tmp} -C /tmp .wwebjs_auth 2>/dev/null || true`);
     if (!fs.existsSync(tmp)) return;
     const data = fs.readFileSync(tmp).toString("base64");
     fs.unlinkSync(tmp);
@@ -94,7 +94,7 @@ function restaurarSesionWA(empresaId) {
     ).get(empresaId);
     if (!row?.valor) return false;
     fs.writeFileSync(tmp, Buffer.from(row.valor, "base64"));
-    execSync(`tar xzf ${tmp} 2>/dev/null || true`);
+    execSync(`tar xzf ${tmp} -C /tmp 2>/dev/null || true`);
     fs.unlinkSync(tmp);
     console.log("[WA] ✓ Sesión restaurada desde SQLite");
     return true;
@@ -141,13 +141,13 @@ function initWAClient(empresaId) {
   // Limpiar singleton locks de Chrome
   const fs   = require("fs");
   const path = require("path");
-  const sessionDir = path.resolve(__dirname, "../../.wwebjs_auth/session");
+  const sessionDir = "/tmp/.wwebjs_auth/session";
   ["SingletonLock", "SingletonCookie", "SingletonSocket"].forEach(f => {
     try { fs.unlinkSync(path.join(sessionDir, f)); } catch {}
   });
 
   waClient = new Client({
-    authStrategy: new LocalAuth({ dataPath: "./.wwebjs_auth" }),
+    authStrategy: new LocalAuth({ dataPath: "/tmp/.wwebjs_auth" }),
     puppeteer: {
       executablePath: execPath,
       headless: true,
