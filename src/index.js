@@ -106,11 +106,23 @@ app.use("/api/",              apiLimiter);
 
 // ── Rutas ─────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
+  const { getEmpresaDb } = require("./db");
+  const nodeVersion = process.version;
+  let dbTest = null;
+  try {
+    const edb = getEmpresaDb("healthcheck");
+    const row = edb.prepare("SELECT COUNT(*) as n FROM cloud_data").get();
+    dbTest = { ok: true, rows: row.n };
+  } catch (err) {
+    dbTest = { ok: false, error: err.message };
+  }
   res.json({
     ok: true,
     servicio: "organizalo-backend",
+    nodeVersion,
     modoSimulacion: config.modoSimulacion,
     haciendaEnv: config.haciendaEnv,
+    dbTest,
   });
 });
 
