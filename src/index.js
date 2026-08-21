@@ -82,7 +82,7 @@ app.set("trust proxy", 1);
 // Auth endpoints — límite estricto para prevenir brute force
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 5,                    // 5 intentos por IP — brute force protection
+  max: 20,                   // 20 intentos por IP — brute force protection
   standardHeaders: true,
   legacyHeaders: false,
   validate: { trustProxy: false }, // desactivar validación de proxy en Railway
