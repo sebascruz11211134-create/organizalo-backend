@@ -33,6 +33,55 @@ let cache = {
   venta:  null,   // indicador 317
 };
 
+// ── Fetch centralizado (BCCR si hay credenciales, sino open.er-api.com) ───────
+async function fetchTipoCambio() {
+  const hoy = new Date().toISOString().split("T")[0];
+  if (cache.fecha === hoy && cache.compra && cache.venta) return cache;
+
+  let compra = null, venta = null, fuente = "open.er-api";
+
+  // Intentar BCCR primero si hay credenciales
+  if (config.bccrToken && config.bccrEmail) {
+    try {
+      const ahora = new Date();
+      [compra, venta] = await Promise.all([
+        consultarBCCR(318, ahora),
+        consultarBCCR(317, ahora),
+      ]);
+      if (compra && venta) fuente = "bccr";
+    } catch (e) {
+      console.warn("[TipoCambio] BCCR falló:", e.message);
+    }
+  }
+
+  // Fallback a open.er-api.com (sin credenciales, gratis)
+  if (!compra || !venta) {
+    try {
+      const r = await fetch("https://open.er-api.com/v6/latest/USD", {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const json = await r.json();
+      const crcRate = json?.rates?.CRC;
+      if (!crcRate) throw new Error("CRC ausente en respuesta");
+      compra = Math.round(crcRate * 100) / 100;
+      venta  = Math.round(crcRate * 1.013 * 100) / 100;
+    } catch (e) {
+      console.warn("[TipoCambio] open.er-api falló:", e.message);
+    }
+  }
+
+  if (compra && venta) {
+    cache = { fecha: hoy, compra, venta };
+    console.log(`[TipoCambio] ${hoy} → compra ₡${compra} | venta ₡${venta} (${fuente})`);
+  }
+
+  return cache;
+}
+
+// Cargar tipo de cambio al arrancar el proceso (evita que el primer request tenga fallback)
+fetchTipoCambio().catch(() => {});
+
 // ── Helper: parsear el XML del BCCR ──────────────────────────────────────────
 function parsearValorBCCR(xmlText) {
   // La respuesta es XML como: <NUM_VALOR>543.21</NUM_VALOR>
@@ -71,81 +120,26 @@ async function consultarBCCR(indicador, fecha) {
 // ── GET /api/tipocambio ───────────────────────────────────────────────────────
 router.get("/", requireJWT, async (req, res) => {
   const hoy = new Date().toISOString().split("T")[0];
-
-  // Servir desde caché si es del mismo día
-  if (cache.fecha === hoy && cache.compra && cache.venta) {
-    return res.json({
-      ok:     true,
-      fecha:  hoy,
-      compra: cache.compra,
-      venta:  cache.venta,
-      fuente: "cache",
-    });
-  }
-
   try {
-    const ahora = new Date();
-    let compra = null, venta = null, fuente = "bccr";
-
-    // ── Intentar BCCR si hay credenciales ────────────────────────────────────
-    if (config.bccrToken && config.bccrEmail) {
-      try {
-        [compra, venta] = await Promise.all([
-          consultarBCCR(318, ahora),
-          consultarBCCR(317, ahora),
-        ]);
-      } catch (e) {
-        console.warn("[TipoCambio] BCCR falló, intentando API pública:", e.message);
-      }
+    const tc = await fetchTipoCambio();
+    if (tc.compra && tc.venta) {
+      return res.json({ ok: true, fecha: tc.fecha || hoy, compra: tc.compra, venta: tc.venta });
     }
-
-    // ── Fallback: open.er-api.com (gratis, sin credenciales) ─────────────────
-    if (!compra || !venta) {
-      fuente = "open.er-api";
-      const r = await fetch("https://open.er-api.com/v6/latest/USD", {
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!r.ok) throw new Error(`open.er-api respondió ${r.status}`);
-      const json = await r.json();
-      const crcRate = json?.rates?.CRC;
-      if (!crcRate) throw new Error("open.er-api no devolvió CRC");
-      // El tipo de cambio de venta (banco vende USD) es levemente mayor al de compra
-      compra = Math.round(crcRate * 100) / 100;
-      venta  = Math.round(crcRate * 1.013 * 100) / 100; // ~1.3% spread típico CR
-    }
-
-    if (!compra || !venta) throw new Error("No se pudo obtener tipo de cambio");
-
-    cache = { fecha: hoy, compra, venta };
-    console.log(`[TipoCambio] ${hoy} → compra ₡${compra} | venta ₡${venta} (${fuente})`);
-
-    res.json({ ok: true, fecha: hoy, compra, venta, fuente });
+    res.json({ ok: false, fecha: hoy, compra: 510, venta: 520, fuente: "fallback" });
   } catch (err) {
-    console.error("[TipoCambio] Error:", err.message);
-
-    // Caché anterior si existe
-    if (cache.compra && cache.venta) {
-      return res.json({
-        ok:     true,
-        fecha:  cache.fecha,
-        compra: cache.compra,
-        venta:  cache.venta,
-        fuente: "cache_anterior",
-      });
-    }
-
     res.json({ ok: false, fecha: hoy, compra: 510, venta: 520, fuente: "fallback", error: err.message });
   }
 });
 
-// ── GET /api/tipocambio/publico — sin JWT (para landing page, etc.) ───────────
+// ── GET /api/tipocambio/publico — sin JWT ────────────────────────────────────
 router.get("/publico", async (req, res) => {
   const hoy = new Date().toISOString().split("T")[0];
-  if (cache.fecha === hoy && cache.compra) {
-    return res.json({ ok: true, fecha: hoy, compra: cache.compra, venta: cache.venta });
+  try {
+    const tc = await fetchTipoCambio();
+    res.json({ ok: true, fecha: tc.fecha || hoy, compra: tc.compra || 510, venta: tc.venta || 520 });
+  } catch {
+    res.json({ ok: true, fecha: hoy, compra: cache.compra || 510, venta: cache.venta || 520 });
   }
-  // No disparar llamada desde endpoint público — devolver último caché o fallback
-  res.json({ ok: true, fecha: cache.fecha || hoy, compra: cache.compra || 530, venta: cache.venta || 540 });
 });
 
 module.exports = router;
