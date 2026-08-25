@@ -46,7 +46,8 @@ function sellarCreadoPor(claveExistente, nuevoArray, autor) {
 
 // ── GET /api/clouddata/ping — diagnóstico ─────────────────────────────────────
 router.get("/ping", requireJWT, (req, res) => {
-  const { empresaId, sub, email } = req.jwtPayload;
+  const { empresaId: rawEmpresaId, sub, email } = req.jwtPayload;
+  const empresaId = rawEmpresaId || sub;
   try {
     const edb = getEmpresaDb(empresaId);
     const count = edb.prepare("SELECT COUNT(*) as n FROM cloud_data").get();
@@ -59,11 +60,13 @@ router.get("/ping", requireJWT, (req, res) => {
 // ── POST /api/clouddata/push ──────────────────────────────────────────────────
 router.post("/push", requireJWT, (req, res) => {
   try {
-    const { empresaId, sub, email } = req.jwtPayload;
+    const { empresaId: rawEmpresaId, sub, email } = req.jwtPayload;
+    // Fallback: tokens viejos sin empresaId usan el userId como bucket
+    const empresaId = rawEmpresaId || sub;
     const { data } = req.body || {};
     if (!data || typeof data !== "object") return res.status(400).json({ error: "data requerido." });
 
-    console.log(`[clouddata/push] empresaId=${empresaId} sub=${sub} claves=${Object.keys(data).length}`);
+    console.log(`[clouddata/push] empresaId=${empresaId} (raw=${rawEmpresaId}) sub=${sub} claves=${Object.keys(data).length}`);
     const edb   = getEmpresaDb(empresaId);
     const now   = new Date().toISOString();
     const autor = { id: sub, email };
@@ -108,8 +111,9 @@ router.post("/push", requireJWT, (req, res) => {
 // ── GET /api/clouddata/pull ───────────────────────────────────────────────────
 router.get("/pull", requireJWT, (req, res) => {
   try {
-    const { empresaId } = req.jwtPayload;
-    console.log(`[clouddata/pull] empresaId=${empresaId}`);
+    const { empresaId: rawEmpresaId, sub } = req.jwtPayload;
+    const empresaId = rawEmpresaId || sub;
+    console.log(`[clouddata/pull] empresaId=${empresaId} (raw=${rawEmpresaId})`);
     const edb = getEmpresaDb(empresaId);
     const rows = edb.prepare("SELECT clave, valor, actualizado_en FROM cloud_data").all();
     const data = {};

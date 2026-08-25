@@ -83,35 +83,47 @@ router.get("/", requireJWT, async (req, res) => {
     });
   }
 
-  // Sin credenciales configuradas → fallback
-  if (!config.bccrToken || !config.bccrEmail) {
-    return res.json({
-      ok:     false,
-      fecha:  hoy,
-      compra: 530,
-      venta:  540,
-      fuente: "fallback",
-      error:  "BCCR_TOKEN o BCCR_EMAIL no configurados en .env",
-    });
-  }
-
   try {
     const ahora = new Date();
-    const [compra, venta] = await Promise.all([
-      consultarBCCR(318, ahora),  // 318 = compra (banco compra USD)
-      consultarBCCR(317, ahora),  // 317 = venta  (banco vende USD)
-    ]);
+    let compra = null, venta = null, fuente = "bccr";
 
-    if (!compra || !venta) throw new Error("No se pudo parsear la respuesta del BCCR");
+    // ── Intentar BCCR si hay credenciales ────────────────────────────────────
+    if (config.bccrToken && config.bccrEmail) {
+      try {
+        [compra, venta] = await Promise.all([
+          consultarBCCR(318, ahora),
+          consultarBCCR(317, ahora),
+        ]);
+      } catch (e) {
+        console.warn("[TipoCambio] BCCR falló, intentando API pública:", e.message);
+      }
+    }
+
+    // ── Fallback: open.er-api.com (gratis, sin credenciales) ─────────────────
+    if (!compra || !venta) {
+      fuente = "open.er-api";
+      const r = await fetch("https://open.er-api.com/v6/latest/USD", {
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!r.ok) throw new Error(`open.er-api respondió ${r.status}`);
+      const json = await r.json();
+      const crcRate = json?.rates?.CRC;
+      if (!crcRate) throw new Error("open.er-api no devolvió CRC");
+      // El tipo de cambio de venta (banco vende USD) es levemente mayor al de compra
+      compra = Math.round(crcRate * 100) / 100;
+      venta  = Math.round(crcRate * 1.013 * 100) / 100; // ~1.3% spread típico CR
+    }
+
+    if (!compra || !venta) throw new Error("No se pudo obtener tipo de cambio");
 
     cache = { fecha: hoy, compra, venta };
-    console.log(`[TipoCambio] ${hoy} → compra ₡${compra} | venta ₡${venta}`);
+    console.log(`[TipoCambio] ${hoy} → compra ₡${compra} | venta ₡${venta} (${fuente})`);
 
-    res.json({ ok: true, fecha: hoy, compra, venta, fuente: "bccr" });
+    res.json({ ok: true, fecha: hoy, compra, venta, fuente });
   } catch (err) {
-    console.error("[TipoCambio] Error al consultar BCCR:", err.message);
+    console.error("[TipoCambio] Error:", err.message);
 
-    // Si el caché del día anterior está disponible, usarlo
+    // Caché anterior si existe
     if (cache.compra && cache.venta) {
       return res.json({
         ok:     true,
@@ -122,15 +134,7 @@ router.get("/", requireJWT, async (req, res) => {
       });
     }
 
-    // Fallback razonable
-    res.json({
-      ok:     false,
-      fecha:  hoy,
-      compra: 530,
-      venta:  540,
-      fuente: "fallback",
-      error:  err.message,
-    });
+    res.json({ ok: false, fecha: hoy, compra: 510, venta: 520, fuente: "fallback", error: err.message });
   }
 });
 

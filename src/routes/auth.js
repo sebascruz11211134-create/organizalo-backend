@@ -37,8 +37,10 @@ function jwtSecret() {
 }
 
 function signToken(user) {
+  // empresaId nunca debe ser null — fallback al user.id para evitar 500 en clouddata
+  const empresaId = user.empresa_id || user.id;
   return jwt.sign(
-    { sub: user.id, email: user.email, empresaId: user.empresa_id, rol: user.rol, plan: user.plan },
+    { sub: user.id, email: user.email, empresaId, rol: user.rol, plan: user.plan },
     jwtSecret(),
     { expiresIn: "7d" }
   );
