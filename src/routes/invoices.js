@@ -5,7 +5,7 @@ const jwt    = require("jsonwebtoken");
 const config = require("../config");
 const { getEmpresaDb, nextNumeroDocumento } = require("../db");
 const { buildClave, buildNumeroConsecutivo } = require("../hacienda/claveGenerator");
-const { buildFacturaElectronicaXML } = require("../hacienda/xmlBuilder");
+const { buildFacturaElectronicaXML, buildTiqueteXML } = require("../hacienda/xmlBuilder");
 const { signXml } = require("../hacienda/signer");
 const { getAccessToken, enviarComprobante, consultarEstado } = require("../hacienda/client");
 
@@ -73,10 +73,15 @@ router.post("/", requireJWT, async (req, res) => {
     const empresaId = req.jwtPayload?.empresaId;
     const edb = getEmpresaDb(empresaId);
     const numeroDocumento = nextNumeroDocumento(empresaId);
-    const numeroConsecutivo = buildNumeroConsecutivo(numeroDocumento, { tipoDocumento: "01" });
+    // tipoDoc: "01"=FE, "04"=TE — determina tipo XML y consecutivo
+    const tipoDocumento = req.body.tipoDoc === "04" ? "04" : "01";
+    const numeroConsecutivo = buildNumeroConsecutivo(numeroDocumento, { tipoDocumento });
     const clave = buildClave({ cedulaEmisor: config.emisor.cedulaNumero, numeroConsecutivo });
 
-    const xml = buildFacturaElectronicaXML({
+    // Tiquete no tiene receptor identificado (consumidor final)
+    const esTiquete = tipoDocumento === "04";
+    const xmlBuilderFn = esTiquete ? buildTiqueteXML : buildFacturaElectronicaXML;
+    const xml = xmlBuilderFn({
       clave,
       numeroConsecutivo,
       emisor: config.emisor,

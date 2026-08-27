@@ -158,4 +158,237 @@ function buildFacturaElectronicaXML({
 </FacturaElectronica>`;
 }
 
-module.exports = { buildFacturaElectronicaXML };
+/**
+ * Tiquete Electrónico v4.4 (tipo 04) — sin receptor identificado.
+ */
+function buildTiqueteXML({ clave, numeroConsecutivo, emisor, items, moneda = "CRC", tipoCambio = 1, condicionVenta = "01" }) {
+  const fechaEmision = new Date().toISOString().slice(0, 19) + "-06:00";
+  const lineas = items.map(buildLineaDetalle).join("");
+
+  let totalGravado = 0, totalImpuesto = 0, totalVenta = 0;
+  for (const item of items) {
+    const cant = Number(item.cantidad) || 0;
+    const pu   = round2(item.precioUnitario);
+    const mt   = round2(cant * pu);
+    const pct  = item.tarifaIva ?? 13;
+    const imp  = round2(mt * (pct / 100));
+    totalGravado  += mt;
+    totalImpuesto += imp;
+    totalVenta    += mt;
+  }
+  const totalComprobante = round2(totalVenta + totalImpuesto);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<TiqueteElectronico xmlns="https://cdn.comprobanteselectronicos.go.cr/xml-schemas/v4.4/tiqueteElectronico">
+  <Clave>${clave}</Clave>
+  <CodigoActividadEmisor>${escapeXml(emisor.codigoActividad)}</CodigoActividadEmisor>
+  <NumeroConsecutivo>${numeroConsecutivo}</NumeroConsecutivo>
+  <FechaEmision>${fechaEmision}</FechaEmision>
+  <Emisor>
+    <Nombre>${escapeXml(emisor.nombre)}</Nombre>
+    <Identificacion>
+      <Tipo>${escapeXml(emisor.cedulaTipo || "02")}</Tipo>
+      <Numero>${escapeXml((emisor.cedulaNumero || "").replace(/\D/g, ""))}</Numero>
+    </Identificacion>
+    <NombreComercial>${escapeXml(emisor.nombreComercial || emisor.nombre)}</NombreComercial>${buildUbicacion(emisor.ubicacion)}
+    <Telefono>
+      <CodigoPais>506</CodigoPais>
+      <NumTelefono>${escapeXml((emisor.telefono || "").replace(/\D/g, ""))}</NumTelefono>
+    </Telefono>
+    <CorreoElectronico>${escapeXml(emisor.correo)}</CorreoElectronico>
+  </Emisor>
+  <CondicionVenta>${condicionVenta}</CondicionVenta>
+  <MedioPago>
+    <TipoMedioPago>01</TipoMedioPago>
+  </MedioPago>
+  <DetalleServicio>${lineas}
+  </DetalleServicio>
+  <ResumenFactura>
+    <CodigoTipoMoneda>
+      <CodigoMoneda>${moneda}</CodigoMoneda>
+      <TipoCambio>${moneda === "USD" ? tipoCambio.toFixed(5) : "1.00000"}</TipoCambio>
+    </CodigoTipoMoneda>
+    <TotalServGravados>0.00</TotalServGravados>
+    <TotalServExentos>0.00</TotalServExentos>
+    <TotalMercanciasGravadas>${totalGravado.toFixed(2)}</TotalMercanciasGravadas>
+    <TotalMercanciasExentas>0.00</TotalMercanciasExentas>
+    <TotalGravado>${totalGravado.toFixed(2)}</TotalGravado>
+    <TotalExento>0.00</TotalExento>
+    <TotalVenta>${totalVenta.toFixed(2)}</TotalVenta>
+    <TotalDescuentos>0.00</TotalDescuentos>
+    <TotalVentaNeta>${totalVenta.toFixed(2)}</TotalVentaNeta>
+    <TotalImpuesto>${totalImpuesto.toFixed(2)}</TotalImpuesto>
+    <TotalComprobante>${totalComprobante.toFixed(2)}</TotalComprobante>
+  </ResumenFactura>
+</TiqueteElectronico>`;
+}
+
+/**
+ * Nota de Crédito Electrónica v4.4 (tipo 03) — anula o corrige una FE.
+ */
+function buildNotaCreditoXML({
+  clave, numeroConsecutivo, emisor, receptor, items,
+  moneda = "CRC", tipoCambio = 1, condicionVenta = "01",
+  referenciaNumero, referenciaTipoDoc = "01", referenciaFecha, referenciaRazon = "Anulación",
+}) {
+  const fechaEmision = new Date().toISOString().slice(0, 19) + "-06:00";
+  const lineas = items.map(buildLineaDetalle).join("");
+
+  let totalGravado = 0, totalImpuesto = 0, totalVenta = 0;
+  for (const item of items) {
+    const cant = Number(item.cantidad) || 0;
+    const pu   = round2(item.precioUnitario);
+    const mt   = round2(cant * pu);
+    const pct  = item.tarifaIva ?? 13;
+    const imp  = round2(mt * (pct / 100));
+    totalGravado  += mt;
+    totalImpuesto += imp;
+    totalVenta    += mt;
+  }
+  const totalComprobante = round2(totalVenta + totalImpuesto);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<NotaCreditoElectronica xmlns="https://cdn.comprobanteselectronicos.go.cr/xml-schemas/v4.4/notaCreditoElectronica">
+  <Clave>${clave}</Clave>
+  <CodigoActividadEmisor>${escapeXml(emisor.codigoActividad)}</CodigoActividadEmisor>
+  <NumeroConsecutivo>${numeroConsecutivo}</NumeroConsecutivo>
+  <FechaEmision>${fechaEmision}</FechaEmision>
+  <Emisor>
+    <Nombre>${escapeXml(emisor.nombre)}</Nombre>
+    <Identificacion>
+      <Tipo>${escapeXml(emisor.cedulaTipo || "02")}</Tipo>
+      <Numero>${escapeXml((emisor.cedulaNumero || "").replace(/\D/g, ""))}</Numero>
+    </Identificacion>
+    <NombreComercial>${escapeXml(emisor.nombreComercial || emisor.nombre)}</NombreComercial>${buildUbicacion(emisor.ubicacion)}
+    <Telefono>
+      <CodigoPais>506</CodigoPais>
+      <NumTelefono>${escapeXml((emisor.telefono || "").replace(/\D/g, ""))}</NumTelefono>
+    </Telefono>
+    <CorreoElectronico>${escapeXml(emisor.correo)}</CorreoElectronico>
+  </Emisor>
+  <Receptor>
+    <Nombre>${escapeXml(receptor.nombre)}</Nombre>
+    ${receptor.cedulaNumero ? `<Identificacion>
+      <Tipo>${escapeXml(receptor.cedulaTipo || "01")}</Tipo>
+      <Numero>${escapeXml(receptor.cedulaNumero.replace(/\D/g, ""))}</Numero>
+    </Identificacion>` : ""}
+    <CorreoElectronico>${escapeXml(receptor.correo || "")}</CorreoElectronico>
+  </Receptor>
+  <CondicionVenta>${condicionVenta}</CondicionVenta>
+  <MedioPago>
+    <TipoMedioPago>01</TipoMedioPago>
+  </MedioPago>
+  <DetalleServicio>${lineas}
+  </DetalleServicio>
+  <ResumenFactura>
+    <CodigoTipoMoneda>
+      <CodigoMoneda>${moneda}</CodigoMoneda>
+      <TipoCambio>${moneda === "USD" ? tipoCambio.toFixed(5) : "1.00000"}</TipoCambio>
+    </CodigoTipoMoneda>
+    <TotalServGravados>0.00</TotalServGravados>
+    <TotalServExentos>0.00</TotalServExentos>
+    <TotalMercanciasGravadas>${totalGravado.toFixed(2)}</TotalMercanciasGravadas>
+    <TotalMercanciasExentas>0.00</TotalMercanciasExentas>
+    <TotalGravado>${totalGravado.toFixed(2)}</TotalGravado>
+    <TotalExento>0.00</TotalExento>
+    <TotalVenta>${totalVenta.toFixed(2)}</TotalVenta>
+    <TotalDescuentos>0.00</TotalDescuentos>
+    <TotalVentaNeta>${totalVenta.toFixed(2)}</TotalVentaNeta>
+    <TotalImpuesto>${totalImpuesto.toFixed(2)}</TotalImpuesto>
+    <TotalComprobante>${totalComprobante.toFixed(2)}</TotalComprobante>
+  </ResumenFactura>
+  <InformacionReferencia>
+    <TipoDoc>${referenciaTipoDoc}</TipoDoc>
+    <Numero>${escapeXml(referenciaNumero || "")}</Numero>
+    <FechaEmisionDoc>${referenciaFecha || fechaEmision}</FechaEmisionDoc>
+    <Codigo>01</Codigo>
+    <Razon>${escapeXml(referenciaRazon)}</Razon>
+  </InformacionReferencia>
+</NotaCreditoElectronica>`;
+}
+
+/**
+ * Nota de Débito Electrónica v4.4 (tipo 02) — cargo adicional a una FE.
+ */
+function buildNotaDebitoXML({
+  clave, numeroConsecutivo, emisor, receptor, items,
+  moneda = "CRC", tipoCambio = 1, condicionVenta = "01",
+  referenciaNumero, referenciaTipoDoc = "01", referenciaFecha, referenciaRazon = "Cargo adicional",
+}) {
+  const fechaEmision = new Date().toISOString().slice(0, 19) + "-06:00";
+  const lineas = items.map(buildLineaDetalle).join("");
+
+  let totalGravado = 0, totalImpuesto = 0, totalVenta = 0;
+  for (const item of items) {
+    const cant = Number(item.cantidad) || 0;
+    const pu   = round2(item.precioUnitario);
+    const mt   = round2(cant * pu);
+    const pct  = item.tarifaIva ?? 13;
+    const imp  = round2(mt * (pct / 100));
+    totalGravado  += mt;
+    totalImpuesto += imp;
+    totalVenta    += mt;
+  }
+  const totalComprobante = round2(totalVenta + totalImpuesto);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<NotaDebitoElectronica xmlns="https://cdn.comprobanteselectronicos.go.cr/xml-schemas/v4.4/notaDebitoElectronica">
+  <Clave>${clave}</Clave>
+  <CodigoActividadEmisor>${escapeXml(emisor.codigoActividad)}</CodigoActividadEmisor>
+  <NumeroConsecutivo>${numeroConsecutivo}</NumeroConsecutivo>
+  <FechaEmision>${fechaEmision}</FechaEmision>
+  <Emisor>
+    <Nombre>${escapeXml(emisor.nombre)}</Nombre>
+    <Identificacion>
+      <Tipo>${escapeXml(emisor.cedulaTipo || "02")}</Tipo>
+      <Numero>${escapeXml((emisor.cedulaNumero || "").replace(/\D/g, ""))}</Numero>
+    </Identificacion>
+    <NombreComercial>${escapeXml(emisor.nombreComercial || emisor.nombre)}</NombreComercial>${buildUbicacion(emisor.ubicacion)}
+    <Telefono>
+      <CodigoPais>506</CodigoPais>
+      <NumTelefono>${escapeXml((emisor.telefono || "").replace(/\D/g, ""))}</NumTelefono>
+    </Telefono>
+    <CorreoElectronico>${escapeXml(emisor.correo)}</CorreoElectronico>
+  </Emisor>
+  <Receptor>
+    <Nombre>${escapeXml(receptor.nombre)}</Nombre>
+    ${receptor.cedulaNumero ? `<Identificacion>
+      <Tipo>${escapeXml(receptor.cedulaTipo || "01")}</Tipo>
+      <Numero>${escapeXml(receptor.cedulaNumero.replace(/\D/g, ""))}</Numero>
+    </Identificacion>` : ""}
+    <CorreoElectronico>${escapeXml(receptor.correo || "")}</CorreoElectronico>
+  </Receptor>
+  <CondicionVenta>${condicionVenta}</CondicionVenta>
+  <MedioPago>
+    <TipoMedioPago>01</TipoMedioPago>
+  </MedioPago>
+  <DetalleServicio>${lineas}
+  </DetalleServicio>
+  <ResumenFactura>
+    <CodigoTipoMoneda>
+      <CodigoMoneda>${moneda}</CodigoMoneda>
+      <TipoCambio>${moneda === "USD" ? tipoCambio.toFixed(5) : "1.00000"}</TipoCambio>
+    </CodigoTipoMoneda>
+    <TotalServGravados>0.00</TotalServGravados>
+    <TotalServExentos>0.00</TotalServExentos>
+    <TotalMercanciasGravadas>${totalGravado.toFixed(2)}</TotalMercanciasGravadas>
+    <TotalMercanciasExentas>0.00</TotalMercanciasExentas>
+    <TotalGravado>${totalGravado.toFixed(2)}</TotalGravado>
+    <TotalExento>0.00</TotalExento>
+    <TotalVenta>${totalVenta.toFixed(2)}</TotalVenta>
+    <TotalDescuentos>0.00</TotalDescuentos>
+    <TotalVentaNeta>${totalVenta.toFixed(2)}</TotalVentaNeta>
+    <TotalImpuesto>${totalImpuesto.toFixed(2)}</TotalImpuesto>
+    <TotalComprobante>${totalComprobante.toFixed(2)}</TotalComprobante>
+  </ResumenFactura>
+  <InformacionReferencia>
+    <TipoDoc>${referenciaTipoDoc}</TipoDoc>
+    <Numero>${escapeXml(referenciaNumero || "")}</Numero>
+    <FechaEmisionDoc>${referenciaFecha || fechaEmision}</FechaEmisionDoc>
+    <Codigo>03</Codigo>
+    <Razon>${escapeXml(referenciaRazon)}</Razon>
+  </InformacionReferencia>
+</NotaDebitoElectronica>`;
+}
+
+module.exports = { buildFacturaElectronicaXML, buildTiqueteXML, buildNotaCreditoXML, buildNotaDebitoXML };

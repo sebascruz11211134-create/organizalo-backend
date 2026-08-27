@@ -25,6 +25,7 @@ const asistenteRouter   = require("./routes/asistente");
 const rockyRouter       = require("./routes/rocky");
 const ntfyRouter        = require("./routes/ntfy");
 const tipocambioRouter  = require("./routes/tipocambio");
+const emisionRouter     = require("./routes/emision");
 
 const app    = express();
 const server = http.createServer(app);
@@ -141,6 +142,7 @@ app.use("/api/asistente",   asistenteRouter);
 app.use("/api/rocky",       rockyRouter);
 app.use("/api/ntfy",        ntfyRouter);
 app.use("/api/tipocambio",  tipocambioRouter);
+app.use("/api/emision",     emisionRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: "Ruta no encontrada." });
