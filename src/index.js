@@ -73,7 +73,8 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "10mb", verify:(req,res,buf)=>{req.rawBody=Buffer.from(buf);} }));
+app.use(express.urlencoded({extended:false,limit:'100kb'}));
 
 app.set("trust proxy", 1);
 
@@ -139,6 +140,8 @@ app.use("/api/eventos",    eventosRouter);
 app.use("/api/crm",        crmRouter);
 app.use("/api/whatsapp",   whatsappRouter);
 app.use("/api/asistente",   asistenteRouter);
+app.use('/api/rocky/channels/gmail',require('./routes/rockyGmail').router);
+app.use('/api/rocky/channels',require('./routes/rockyChannels').router);
 app.use("/api/rocky",       rockyRouter);
 app.use("/api/ntfy",        ntfyRouter);
 app.use("/api/tipocambio",  tipocambioRouter);
@@ -150,8 +153,10 @@ app.use((req, res) => {
 
 // ── Cron: recordatorios diarios a las 8am ────────────────────────────────────
 setInterval(() => {
+  const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'America/Costa_Rica',hour:'2-digit',minute:'2-digit',day:'2-digit',hourCycle:'h23'}).formatToParts(new Date());
+  const local=Object.fromEntries(parts.map(p=>[p.type,p.value]));
   const now = new Date();
-  if (now.getHours() === 8 && now.getMinutes() < 5) {
+  if (Number(local.hour) === 8 && Number(local.minute) < 5) {
     enviarRecordatoriosHoy().catch(console.error);
     verificarVencimientos().catch(console.error);
     // Depreciación mensual: solo el día 1 de cada mes
@@ -412,6 +417,9 @@ async function generarAsientosDepreciacion() {
     console.error("[cron/depreciacion]", err.message);
   }
 }
+
+require('./services/rockyRuntime').start();
+require('./routes/rockyGmail').start();
 
 // ── Servidor ──────────────────────────────────────────────────────────────────
 server.listen(config.port, () => {
