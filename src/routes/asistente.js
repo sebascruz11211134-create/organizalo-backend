@@ -55,19 +55,11 @@ function fmtCRC(n) {
 
 /** Carga un array de cloud_data para una empresa */
 function cargarDato(empresaId, clave) {
-  const row = db.prepare(
-    "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = ?"
-  ).get(empresaId, clave);
-  if (!row) return [];
-  const data = parse(row.valor);
-  return Array.isArray(data) ? data : (data ? [data] : []);
+  const data = require('../services/erpData').read(empresaId, clave, []);
+  return Array.isArray(data) ? data : [];
 }
-
 function cargarObjeto(empresaId, clave) {
-  const row = db.prepare(
-    "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = ?"
-  ).get(empresaId, clave);
-  return row ? (parse(row.valor) || {}) : {};
+  return require('../services/erpData').read(empresaId, clave, {});
 }
 
 // ── Definición de herramientas ─────────────────────────────────────────────────
@@ -493,6 +485,13 @@ router.post("/chat", requireJWT, checkQuota, async (req, res) => {
     if (!msgLimpios.length || msgLimpios[msgLimpios.length - 1].role !== "user")
       return res.status(400).json({ error: "El último mensaje debe ser del usuario." });
 
+    const allowByRole = {
+      ventas:['buscar_facturas','buscar_cxc','buscar_inventario','buscar_contactos','buscar_pedidos','buscar_cotizaciones'],
+      bodega:['buscar_inventario','buscar_pedidos'],
+      contabilidad:['buscar_facturas','buscar_cxc','buscar_cxp','buscar_compras','resumen_financiero'],
+    };
+    const allowed=['superadmin','admin','gerencia'].includes(rol) ? TOOLS : TOOLS.filter(t=>(allowByRole[rol]||[]).includes(t.name));
+    if(!allowed.length) return res.status(403).json({error:'Tu rol no tiene herramientas del asistente habilitadas.'});
     const rolesNombres = {
       admin: "Administrador", gerencia: "Gerencia", ventas: "Ventas",
       contabilidad: "Contabilidad", bodega: "Bodega", rrhh: "RRHH",
@@ -527,7 +526,7 @@ REGLAS:
         model:      "claude-haiku-4-5-20251001",
         max_tokens: 1500,
         system:     systemPrompt,
-        tools:      TOOLS,
+        tools:      allowed,
         messages:   mensajes,
       });
 
@@ -551,7 +550,7 @@ REGLAS:
         // Ejecutar cada tool y armar resultados
         const toolResults = toolUseBlocks.map(tb => {
           toolsUsados.push(tb.name);
-          const resultado = ejecutarTool(tb.name, tb.input || {}, empresaId);
+          const resultado = allowed.some(t=>t.name===tb.name) ? ejecutarTool(tb.name, tb.input || {}, empresaId) : {error:"Herramienta no permitida para tu rol"};
           return {
             type:        "tool_result",
             tool_use_id: tb.id,

@@ -20,11 +20,21 @@ const express   = require("express");
 const jwt       = require("jsonwebtoken");
 const Anthropic = require("@anthropic-ai/sdk");
 const { v4: uuidv4 } = require("uuid");
-const { getEmpresaDb } = require("../db");
+const { db, getEmpresaDb } = require("../db");
+const { read: readERP } = require("../services/erpData");
+const admin = require("../middleware/rockyAdmin");
+const { validateSchedule } = require("../services/rockySchedule");
 const config    = require("../config");
 const { registerUsage } = require("../middleware/apiQuota");
 
 const router = express.Router();
+const {valid:validTwilio,xml}=require('../services/twilioSignature');
+function twilioAuth(req,res,next) {
+  if(!process.env.TWILIO_AUTH_TOKEN) return res.sendStatus(503);
+  if(!validTwilio(config.publicUrl+req.originalUrl,req.body||{},req.headers['x-twilio-signature'],process.env.TWILIO_AUTH_TOKEN)) return res.sendStatus(403);
+  next();
+}
+db.exec('CREATE TABLE IF NOT EXISTS rocky_call_sessions (sid TEXT PRIMARY KEY, empresa_id TEXT NOT NULL, caller TEXT, created_at INTEGER NOT NULL)');
 
 // ── Auth middleware (para rutas protegidas) ───────────────────────────────────
 function requireJWT(req, res, next) {
@@ -52,8 +62,8 @@ function parse(str) {
 function twimlGather(mensaje, accionUrl, timeout = 5) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${accionUrl}" method="POST" timeout="${timeout}" language="es-MX" speechTimeout="auto">
-    <Say voice="Polly.Lupe" language="es-MX">${mensaje}</Say>
+  <Gather input="speech" action="${xml(accionUrl)}" method="POST" timeout="${timeout}" language="es-MX" speechTimeout="auto">
+    <Say voice="Polly.Lupe" language="es-MX">${xml(mensaje)}</Say>
   </Gather>
   <Say voice="Polly.Lupe" language="es-MX">No escuché nada. Por favor llame de nuevo. ¡Hasta pronto!</Say>
   <Hangup/>
@@ -64,24 +74,14 @@ function twimlGather(mensaje, accionUrl, timeout = 5) {
 function twimlSay(mensaje) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Lupe" language="es-MX">${mensaje}</Say>
+  <Say voice="Polly.Lupe" language="es-MX">${xml(mensaje)}</Say>
   <Hangup/>
 </Response>`;
 }
 
 /** Carga configuración del agente por empresa */
 function cargarConfigRocky(empresaId) {
-  const edb = getEmpresaDb(empresaId);
-  const row = edb.prepare(
-    "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_config'"
-  ).get(empresaId);
-  return parse(row?.valor) || {
-    tipoNegocio: "general",
-    activo: false,
-    bienvenida: "",
-    horario: "24h",
-    emailConfirmacion: true,
-  };
+  return readERP(empresaId,'rocky_config',{activo:false,horarioInicio:'',horarioFin:'',zonaHoraria:'America/Costa_Rica',modoRespuestas:'borrador'});
 }
 
 /** Carga datos del menú o servicios de la empresa */
@@ -93,12 +93,8 @@ function cargarContextoEmpresa(empresaId, tipoNegocio) {
       ? ["settings", "empleados"]
       : ["settings"];
 
-  const rows = edb.prepare(
-    `SELECT clave, valor FROM cloud_data WHERE empresa_id = ? AND clave IN (${datosClaves.map(() => "?").join(",")})`
-  ).all(empresaId, ...datosClaves);
-
-  const datos = {};
-  for (const row of rows) datos[row.clave] = parse(row.valor) || {};
+  const datos={};
+  for(const key of datosClaves) datos[key]=readERP(empresaId,key,key==='settings'?{}:[]);
   return datos;
 }
 
@@ -106,8 +102,8 @@ function cargarContextoEmpresa(empresaId, tipoNegocio) {
 function guardarLlamada(empresaId, llamada) {
   const edb = getEmpresaDb(empresaId);
   const histRow = edb.prepare(
-    "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_historial'"
-  ).get(empresaId);
+    "SELECT valor FROM cloud_data WHERE clave = 'rocky_historial'"
+  ).get();
   const historial = parse(histRow?.valor) || [];
   historial.unshift({ ...llamada, id: uuidv4(), fecha: ahora() });
   // Mantener máximo 200 llamadas
@@ -143,21 +139,22 @@ async function enviarEmailConfirmacion({ to, subject, html }) {
 // Twilio llama aquí cuando alguien llama al número.
 // Respondemos con TwiML para recoger la voz del cliente.
 
-router.post("/llamada", async (req, res) => {
+router.post("/llamada", twilioAuth, async (req, res) => {
   res.set("Content-Type", "text/xml");
   try {
     const { To: numeroDestino, From: numeroCaller, CallSid } = req.body || {};
 
     // Buscar empresa por número Twilio
-    const configRow = db.prepare(
-      "SELECT empresa_id, valor FROM cloud_data WHERE clave = 'rocky_config' AND JSON_EXTRACT(valor, '$.numeroTwilio') = ?"
-    ).get(numeroDestino);
+    const candidates=db.prepare('SELECT DISTINCT empresa_id FROM users WHERE activo=1 AND empresa_id IS NOT NULL').all();
+    const matches=candidates.map(e=>({empresa_id:e.empresa_id,config:cargarConfigRocky(e.empresa_id)})).filter(e=>e.config.numeroTwilio===numeroDestino);
+    const configRow=matches.length===1?{empresa_id:matches[0].empresa_id,valor:JSON.stringify(matches[0].config)}:null;
 
     if (!configRow) {
       return res.send(twimlSay("Lo sentimos, este número no está configurado. Adiós."));
     }
 
     const empresaId = configRow.empresa_id;
+    db.prepare('INSERT OR REPLACE INTO rocky_call_sessions VALUES(?,?,?,?)').run(CallSid,empresaId,numeroCaller,Date.now());
     const rockyConfig = parse(configRow.valor) || {};
 
     if (!rockyConfig.activo) {
@@ -165,10 +162,7 @@ router.post("/llamada", async (req, res) => {
     }
 
     // Obtener nombre de empresa
-    const settingsRow = db.prepare(
-      "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'settings'"
-    ).get(empresaId);
-    const settings = parse(settingsRow?.valor) || {};
+    const settings = readERP(empresaId,'settings',{});
     const nombreEmpresa = settings.nombreNegocio || "nuestra empresa";
 
     const bienvenida = rockyConfig.bienvenida ||
@@ -187,11 +181,13 @@ router.post("/llamada", async (req, res) => {
 // Twilio envía la transcripción de lo que dijo el cliente.
 // Claude analiza la intención y respondemos con voz.
 
-router.post("/transcripcion", async (req, res) => {
+router.post("/transcripcion", twilioAuth, async (req, res) => {
   res.set("Content-Type", "text/xml");
   try {
     const { empresaId, callSid } = req.query;
     const { SpeechResult: texto, From: telefono } = req.body || {};
+    const call=db.prepare('SELECT * FROM rocky_call_sessions WHERE sid=? AND empresa_id=? AND caller=? AND created_at>?').get(callSid,empresaId,telefono,Date.now()-3600000);
+    if(!call || req.body.CallSid!==callSid) return res.sendStatus(403);
 
     if (!texto || !empresaId) {
       return res.send(twimlSay("No pude escuchar bien. Por favor intente de nuevo."));
@@ -227,8 +223,8 @@ ${contextoExtra}
 
 INSTRUCCIONES:
 - Responde de forma natural y breve (máximo 2-3 oraciones) como si hablaras por teléfono.
-- Si el cliente pide comida, confirma los items y el total aproximado.
-- Si el cliente quiere una cita, confirma el servicio, fecha y hora preferida.
+- Si el cliente pide un pedido o cita, explicá que registrarás la solicitud para revisión; no afirmes haberlo creado.
+- No inventes fechas, precios ni disponibilidad.
 - Si no tienes info suficiente, pregunta solo lo más importante.
 - Al final de la respuesta, incluye en una línea nueva: ACCION: [PEDIDO|CITA|PREGUNTA|NINGUNA]
 - Si es PEDIDO o CITA, incluye también: RESUMEN: [resumen breve del pedido o cita]
@@ -268,49 +264,12 @@ INSTRUCCIONES:
       respuesta: textoVoz,
       accion,
       resumen,
-      resultado: "completado",
+      resultado: accion === "PEDIDO" || accion === "CITA" ? "requiere_revision" : "respondido",
       duracion: "N/D",
     });
 
-    // Si se completó un pedido: crear en cloud_data
-    if (accion === "PEDIDO") {
-      const edb = getEmpresaDb(empresaId);
-      const pedidosRow = edb.prepare(
-        "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'pedidos'"
-      ).get(empresaId);
-      const pedidos = parse(pedidosRow?.valor) || [];
-      const nuevoPedido = {
-        id: uuidv4(),
-        numero: `P-ROCKY-${Date.now()}`,
-        origen: "rocky",
-        clienteTelefono: telefono,
-        descripcion: resumen,
-        estado: "pendiente",
-        fecha: hoy(),
-        creadoEn: ahora(),
-      };
-      pedidos.push(nuevoPedido);
-      edb.prepare(
-        "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
-      ).run(empresaId, "pedidos", JSON.stringify(pedidos), ahora());
-    }
-
-    // Si se agendó una cita: crear evento en tabla eventos
-    if (accion === "CITA") {
-      const edb = getEmpresaDb(empresaId);
-      edb.prepare(`
-        INSERT INTO eventos (id, empresa_id, titulo, descripcion, tipo, fecha, hora, todo_el_dia, creado_en)
-        VALUES (?, ?, ?, ?, 'cita', ?, ?, 0, ?)
-      `).run(
-        uuidv4(),
-        empresaId,
-        `Cita (Rocky): ${telefono}`,
-        resumen,
-        hoy(),
-        "09:00",
-        ahora()
-      );
-    }
+    // Actions extracted from speech remain in the call history for review.
+    // A structured, confirmed action is required before mutating orders or appointments.
 
     // Email de confirmación
     if (rockyConfig.emailConfirmacion && settings.correo) {
@@ -339,10 +298,12 @@ INSTRUCCIONES:
 // ── POST /api/rocky/config ────────────────────────────────────────────────────
 // Guardar configuración del agente
 
-router.post("/config", requireJWT, (req, res) => {
+router.post("/config", admin, (req, res) => {
   try {
     const { empresaId } = req.jwtPayload;
-    const configData = req.body;
+    const configData = {...cargarConfigRocky(empresaId), ...req.body};
+    try { validateSchedule(configData); } catch(e) {return res.status(400).json({error:e.message});}
+    if(!['automatico','borrador'].includes(configData.modoRespuestas || 'borrador')) return res.status(400).json({error:'Modo inválido'});
     const edb = getEmpresaDb(empresaId);
     edb.prepare(
       "INSERT INTO cloud_data (empresa_id, clave, valor, actualizado_en) VALUES (?,?,?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en"
@@ -355,7 +316,7 @@ router.post("/config", requireJWT, (req, res) => {
 });
 
 // ── GET /api/rocky/config ─────────────────────────────────────────────────────
-router.get("/config", requireJWT, (req, res) => {
+router.get("/config", admin, (req, res) => {
   try {
     const { empresaId } = req.jwtPayload;
     const rockyConfig = cargarConfigRocky(empresaId);
@@ -366,13 +327,13 @@ router.get("/config", requireJWT, (req, res) => {
 });
 
 // ── GET /api/rocky/historial ──────────────────────────────────────────────────
-router.get("/historial", requireJWT, (req, res) => {
+router.get("/historial", admin, (req, res) => {
   try {
     const { empresaId } = req.jwtPayload;
     const edb = getEmpresaDb(empresaId);
     const row = edb.prepare(
-      "SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'rocky_historial'"
-    ).get(empresaId);
+      "SELECT valor FROM cloud_data WHERE clave = 'rocky_historial'"
+    ).get();
     const historial = parse(row?.valor) || [];
     res.json({ historial, total: historial.length });
   } catch (err) {

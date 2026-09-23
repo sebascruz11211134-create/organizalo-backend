@@ -57,74 +57,19 @@ router.get("/ping", requireJWT, (req, res) => {
   }
 });
 
-// ── POST /api/clouddata/push ──────────────────────────────────────────────────
-router.post("/push", requireJWT, (req, res) => {
+const store = require('../services/cloudStore');
+router.post('/push', requireJWT, (req,res) => {
   try {
-    const { empresaId: rawEmpresaId, sub, email } = req.jwtPayload;
-    // Fallback: tokens viejos sin empresaId usan el userId como bucket
-    const empresaId = rawEmpresaId || sub;
-    const { data } = req.body || {};
-    if (!data || typeof data !== "object") return res.status(400).json({ error: "data requerido." });
-
-    console.log(`[clouddata/push] empresaId=${empresaId} (raw=${rawEmpresaId}) sub=${sub} claves=${Object.keys(data).length}`);
-    const edb   = getEmpresaDb(empresaId);
-    const now   = new Date().toISOString();
-    const autor = { id: sub, email };
-
-    // Cargar datos actuales de las claves auditables (para comparar)
-    const existentes = {};
-    for (const clave of Object.keys(data)) {
-      if (!CLAVES_AUDITABLES.has(clave)) continue;
-      const row = edb.prepare("SELECT valor FROM cloud_data WHERE clave = ?").get(clave);
-      existentes[clave] = row?.valor ? JSON.parse(row.valor) : [];
-    }
-
-    const insert = edb.prepare(`
-      INSERT INTO cloud_data (clave, valor, actualizado_en)
-      VALUES (?, ?, ?)
-      ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor, actualizado_en = excluded.actualizado_en
-    `);
-
-    for (let [clave, valor] of Object.entries(data)) {
-      if (CLAVES_AUDITABLES.has(clave)) {
-        valor = sellarCreadoPor(existentes[clave], valor, autor);
-      }
-      insert.run(clave, JSON.stringify(valor), now);
-    }
-
-    // ── Notificar a todos los demás clientes de la misma empresa en tiempo real ──
-    const io = req.app.get("io");
-    if (io) {
-      io.to(`empresa:${empresaId}:general`).emit("data:changed", {
-        updatedAt: now,
-        origen:    req.jwtPayload.userId || "unknown",
-      });
-    }
-
-    res.json({ ok: true, claves: Object.keys(data).length });
-  } catch (err) {
-    console.error("[clouddata/push]", err.stack || err.message || err);
-    res.status(500).json({ error: err.message || "Error interno." });
-  }
+    const { data, baseVersions } = req.body || {};
+    if (!data || Array.isArray(data) || typeof data !== 'object') return res.status(400).json({error:'data requerido'});
+    const empresaId=req.jwtPayload.empresaId || req.jwtPayload.sub;
+    const result=store.push(getEmpresaDb(empresaId),data,baseVersions,req.jwtPayload.sub);
+    req.app.get('io')?.to(`empresa:${empresaId}:general`).emit('data:changed',{updatedAt:new Date().toISOString()});
+    res.json({ok:true,...result});
+  } catch(e) { res.status(e.status || 500).json({error:e.message,conflicts:e.conflicts}); }
 });
-
-// ── GET /api/clouddata/pull ───────────────────────────────────────────────────
-router.get("/pull", requireJWT, (req, res) => {
-  try {
-    const { empresaId: rawEmpresaId, sub } = req.jwtPayload;
-    const empresaId = rawEmpresaId || sub;
-    console.log(`[clouddata/pull] empresaId=${empresaId} (raw=${rawEmpresaId})`);
-    const edb = getEmpresaDb(empresaId);
-    const rows = edb.prepare("SELECT clave, valor, actualizado_en FROM cloud_data").all();
-    const data = {};
-    for (const row of rows) {
-      try { data[row.clave] = JSON.parse(row.valor); } catch { data[row.clave] = row.valor; }
-    }
-    res.json({ data, total: rows.length });
-  } catch (err) {
-    console.error("[clouddata/pull]", err.stack || err.message || err);
-    res.status(500).json({ error: err.message || "Error interno." });
-  }
+router.get('/pull', requireJWT, (req,res) => {
+  try { res.json(store.snapshot(getEmpresaDb(req.jwtPayload.empresaId || req.jwtPayload.sub))); }
+  catch(e) { res.status(500).json({error:e.message}); }
 });
-
-module.exports = router;
+module.exports=router;

@@ -12,6 +12,16 @@ const config    = require("../config");
 const { db: sharedDb, getEmpresaDb } = require("../db");
 
 const router = express.Router();
+const runtime = require('../services/rockyRuntime');
+const publicReply = require('../services/rockyReply');
+const { dentroDelHorario } = require('../services/rockySchedule');
+const { read: readERP } = require('../services/erpData');
+const { createHash } = require('node:crypto');
+const admin = require('../middleware/rockyAdmin');
+const ownSends = new Set();
+const pendingSends = new Set();
+let backupTimer;
+
 
 // ── JWT middleware ────────────────────────────────────────────────────────────
 function requireJWT(req, res, next) {
@@ -189,35 +199,24 @@ function initWAClient(empresaId) {
     // Guardar sesión en SQLite inmediatamente y luego cada 5 minutos
     if (waEmpresaId) {
       backupSesionWA(waEmpresaId);
-      setInterval(() => backupSesionWA(waEmpresaId), 5 * 60 * 1000);
+      clearInterval(backupTimer);
+      backupTimer = setInterval(() => backupSesionWA(waEmpresaId), 5 * 60 * 1000);
+      backupTimer.unref();
     }
   });
 
   // ── Auto-respuesta con Rocky IA ──────────────────────────────────────────
   waClient.on("message", async (msg) => {
-    if (msg.isGroupMsg || msg.fromMe || msg.from === "status@broadcast") return;
-    if (!waEmpresaId) return;
+    if (msg.isGroupMsg || msg.fromMe || !/@c\.us$/.test(msg.from) || !waEmpresaId || process.env.WA_EMPRESA_ID===waEmpresaId && process.env.WA_CLOUD_TOKEN) return;
     try {
-      // Onboarding: crear contacto si es la primera vez que escribe
-      const { esNuevo } = onboardearContacto(waEmpresaId, msg.from);
-
-      // Si es nuevo y hay mensaje de bienvenida configurado, enviarlo primero
-      if (esNuevo) {
-        let rockyConfig = {};
-        try {
-          const r = getEmpresaDb(waEmpresaId).prepare("SELECT valor FROM cloud_data WHERE clave='rocky_config'").get();
-          if (r?.valor) rockyConfig = JSON.parse(r.valor);
-        } catch (_) {}
-        if (rockyConfig.mensajeBienvenida) {
-          await msg.reply(rockyConfig.mensajeBienvenida);
-        }
-      }
-
-      const respuesta = await consultarRockyWA(msg.body, msg.from, waEmpresaId);
-      if (respuesta) await msg.reply(respuesta);
-    } catch (e) {
-      console.error("[WhatsApp] Error en auto-reply:", e.message);
-    }
+      runtime.inbox.enqueue({empresaId:waEmpresaId,channel:'whatsapp-web',externalId:msg.id._serialized,sender:msg.from,
+        payload:{text:msg.body||'',unsupported:msg.hasMedia||msg.type!=='chat'}});
+    } catch(e) { console.error('[WhatsApp inbox]',e.message); }
+  });
+  waClient.on('message_create', msg => {
+    if (!msg.fromMe || !waEmpresaId || ownSends.has(msg.id?._serialized) || pendingSends.has(`${msg.to}:${msg.body}`)) return;
+    // API-generated sends are also seen here: a short pause is conservative.
+    runtime.inbox.pause(waEmpresaId,'whatsapp-web',msg.to,Date.now()+15*60000);
   });
 
   waClient.on("auth_failure", () => {
@@ -249,7 +248,7 @@ function initWAClient(empresaId) {
 
 // Auto-inicializar si el paquete está instalado.
 // Intenta restaurar la empresa que tenía WA activo antes del reinicio.
-if (getWWebJS()) {
+if (process.env.WA_WEB_ENABLED === "true" && getWWebJS()) {
   const empresaGuardada = leerWAEmpresaId();
   if (empresaGuardada) {
     console.log(`[WA] Auto-restaurando sesión para empresa: ${empresaGuardada}`);
@@ -338,19 +337,6 @@ function guardarHistorial(empresaId, phone, mensajes) {
 }
 
 // ── Horario de atención ───────────────────────────────────────────────────────
-
-function dentroDelHorario(rockyConfig) {
-  const inicio = rockyConfig?.horarioInicio; // "08:00"
-  const fin    = rockyConfig?.horarioFin;    // "20:00"
-  if (!inicio || !fin) return true; // sin horario configurado = siempre activo
-  const ahora = new Date();
-  const [hI, mI] = inicio.split(":").map(Number);
-  const [hF, mF] = fin.split(":").map(Number);
-  const minutos = ahora.getHours() * 60 + ahora.getMinutes();
-  const minInicio = hI * 60 + mI;
-  const minFin    = hF * 60 + mF;
-  return minutos >= minInicio && minutos < minFin;
-}
 
 // ── Herramientas de Rocky ─────────────────────────────────────────────────────
 
@@ -487,7 +473,7 @@ const ROCKY_TOOLS = [
 ];
 
 // ── Rocky IA para WhatsApp ────────────────────────────────────────────────────
-async function consultarRockyWA(mensajeCliente, from, empresaId) {
+async function consultarRockyWA(mensajeCliente, from, empresaId, eventId) {
   if (!config.anthropicApiKey) return null;
 
   // Cargar config de Rocky y datos de la empresa
@@ -497,11 +483,10 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
     const edb = getEmpresaDb(empresaId);
     const rcRow = edb.prepare("SELECT valor FROM cloud_data WHERE clave = 'rocky_config'").get();
     rockyConfig = rcRow ? JSON.parse(rcRow.valor) : {};
-    const stRow = edb.prepare("SELECT valor FROM cloud_data WHERE clave = 'settings'").get();
-    settingsEmpresa = stRow ? JSON.parse(stRow.valor) : {};
+    settingsEmpresa = readERP(empresaId, "settings", {});
   } catch (_) {}
 
-  if (rockyConfig.activo === false) return null;
+  if (rockyConfig.activo !== true) return null;
 
   // Verificar horario de atención
   if (!dentroDelHorario(rockyConfig)) {
@@ -509,7 +494,7 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
       `Gracias por escribirnos. Nuestro horario de atención es de ${rockyConfig.horarioInicio || "08:00"} a ${rockyConfig.horarioFin || "20:00"}. Te responderemos a la brevedad. 🙏`;
   }
 
-  const nombreEmpresa = settingsEmpresa?.empresa || rockyConfig?.nombreEmpresa || "la empresa";
+  const nombreEmpresa = settingsEmpresa?.nombreNegocio || settingsEmpresa?.empresa || rockyConfig?.nombreEmpresa || "la empresa";
   const tipoNegocio   = rockyConfig?.tipoNegocio || "general";
   const instrucciones = rockyConfig?.instrucciones || "";
 
@@ -529,7 +514,7 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
   ];
 
   try {
-    const anthropic  = new Anthropic({ apiKey: config.anthropicApiKey });
+    const anthropic  = new Anthropic({ apiKey: config.anthropicApiKey, timeout:60000, maxRetries:1 });
     let respuestaFinal = null;
 
     // Agentic loop: hasta 4 rondas de tool use
@@ -559,14 +544,25 @@ async function consultarRockyWA(mensajeCliente, from, empresaId) {
           if (bloque.type !== "tool_use") continue;
           let resultado;
           const inp = bloque.input || {};
-          if (bloque.name === "consultar_inventario") {
-            resultado = ejecutarConsultarInventario(empresaId, inp.nombre);
-          } else if (bloque.name === "crear_pedido") {
-            resultado = ejecutarCrearPedido(empresaId, from, inp.cliente_nombre, inp.items, inp.notas);
-          } else if (bloque.name === "agendar_cita") {
-            resultado = ejecutarAgendarCita(empresaId, from, inp.titulo, inp.fecha, inp.hora, inp.cliente_nombre, inp.notas);
-          } else {
-            resultado = { error: "Herramienta desconocida" };
+          const perform = () => {
+            if (bloque.name === 'consultar_inventario') return ejecutarConsultarInventario(empresaId,inp.nombre);
+            if (bloque.name === 'crear_pedido') return ejecutarCrearPedido(empresaId,from,inp.cliente_nombre,inp.items,inp.notas);
+            if (bloque.name === 'agendar_cita') return ejecutarAgendarCita(empresaId,from,inp.titulo,inp.fecha,inp.hora,inp.cliente_nombre,inp.notas);
+            return {error:'Herramienta desconocida'};
+          };
+          if (bloque.name === 'consultar_inventario') resultado=perform();
+          else {
+            const edb=getEmpresaDb(empresaId);
+            edb.exec('CREATE TABLE IF NOT EXISTS rocky_actions (id TEXT PRIMARY KEY, result TEXT NOT NULL)');
+            // One action of each type per received message. Changed AI arguments still cannot duplicate it.
+            const actionId=createHash('sha256').update(`${eventId}:${bloque.name}`).digest('hex');
+            edb.exec('BEGIN IMMEDIATE');
+            try {
+              const cached=edb.prepare('SELECT result FROM rocky_actions WHERE id=?').get(actionId);
+              resultado=cached?JSON.parse(cached.result):perform();
+              if(!cached) edb.prepare('INSERT INTO rocky_actions VALUES(?,?)').run(actionId,JSON.stringify(resultado));
+              edb.exec('COMMIT');
+            } catch(e) { edb.exec('ROLLBACK'); throw e; }
           }
           toolResults.push({ type: "tool_result", tool_use_id: bloque.id, content: JSON.stringify(resultado) });
         }
@@ -613,8 +609,16 @@ async function qrToBase64(raw) {
   return null;
 }
 
+router.use((req,res,next) => {
+  if (process.env.WA_WEB_ENABLED !== 'true') return res.status(503).json({error:'Conector QR desactivado. Usá Cloud API o habilitalo en el servidor.'});
+  admin(req,res,()=> {
+    if(waEmpresaId && waEmpresaId!==req.jwtPayload.empresaId) return res.status(403).json({error:'Este conector pertenece a otra empresa.'});
+    next();
+  });
+});
+
 // ── GET /api/whatsapp/status ──────────────────────────────────────────────────
-router.get("/status", requireJWT, (req, res) => {
+router.get("/status", admin, (req, res) => {
   if (!getWWebJS()) {
     return res.json({ ok: false, estado: "no_instalado",
       error: "Ejecutá: npm install whatsapp-web.js qrcode en la carpeta del backend" });
@@ -624,7 +628,7 @@ router.get("/status", requireJWT, (req, res) => {
 
 // ── GET /api/whatsapp/qr ──────────────────────────────────────────────────────
 // Responde inmediatamente con el estado actual. El frontend hace polling cada 3s.
-router.get("/qr", requireJWT, async (req, res) => {
+router.get("/qr", admin, async (req, res) => {
   if (!getWWebJS()) {
     return res.status(500).json({ ok: false,
       error: "whatsapp-web.js no instalado. Ejecutá INSTALL-WHATSAPP.command en el Desktop." });
@@ -644,8 +648,7 @@ router.get("/qr", requireJWT, async (req, res) => {
   if (waQRRaw) {
     const base64 = await qrToBase64(waQRRaw);
     if (base64) return res.json({ ok: true, qr: { base64 } });
-    const externalUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(waQRRaw)}`;
-    return res.json({ ok: true, qr: { base64url: externalUrl } });
+    return res.status(503).json({ok:false,error:"No se pudo generar el QR localmente."});
   }
 
   // Aún inicializando — el frontend debe reintentar en 3s
@@ -653,7 +656,7 @@ router.get("/qr", requireJWT, async (req, res) => {
 });
 
 // ── POST /api/whatsapp/send ───────────────────────────────────────────────────
-router.post("/send", requireJWT, async (req, res) => {
+router.post("/send", admin, async (req, res) => {
   const { numero, mensaje } = req.body;
   if (!numero || !mensaje) return res.status(400).json({ error: "numero y mensaje son requeridos" });
   if (!waReady || !waClient) return res.status(503).json({ ok: false, error: "WhatsApp no conectado. Escaneá el QR primero." });
@@ -668,7 +671,7 @@ router.post("/send", requireJWT, async (req, res) => {
 });
 
 // ── POST /api/whatsapp/send-reminder ─────────────────────────────────────────
-router.post("/send-reminder", requireJWT, async (req, res) => {
+router.post("/send-reminder", admin, async (req, res) => {
   const { numero, clienteNombre, empresaNombre, mensaje } = req.body;
   if (!numero) return res.status(400).json({ error: "numero requerido" });
   if (!waReady || !waClient) return res.status(503).json({ ok: false, error: "WhatsApp no conectado" });
@@ -689,9 +692,9 @@ router.post("/send-reminder", requireJWT, async (req, res) => {
 });
 
 // ── POST /api/whatsapp/reconectar ─────────────────────────────────────────────
-router.post("/reconectar", requireJWT, (req, res) => {
+router.post("/reconectar", admin, (req, res) => {
   if (!getWWebJS()) return res.status(500).json({ ok: false, error: "whatsapp-web.js no instalado" });
-  initWAClient();
+  initWAClient(req.jwtPayload.empresaId);
   res.json({ ok: true, mensaje: "Reconectando..." });
 });
 
@@ -699,55 +702,42 @@ module.exports = router;
 
 // ── Cron: recordatorios diarios a las 8am ────────────────────────────────────
 async function enviarRecordatoriosHoy() {
-  if (!waReady || !waClient) {
-    console.log("[WhatsApp cron] No conectado, saltando recordatorios");
-    return;
-  }
-  const hoy = new Date().toISOString().split("T")[0];
-  console.log(`[WhatsApp cron] Buscando recordatorios para ${hoy}`);
-  try {
-    const eventos = db.prepare(`
-      SELECT e.*, u.empresa_nombre
-      FROM eventos e
-      LEFT JOIN users u ON u.empresa_id = e.empresa_id
-      WHERE e.fecha = ? AND e.tipo = 'seguimiento' AND e.completado = 0 AND e.cliente_id IS NOT NULL
-      GROUP BY e.id
-    `).all(hoy);
-    console.log(`[WhatsApp cron] ${eventos.length} recordatorios encontrados`);
-    for (const ev of eventos) {
-      let telefono = null;
-      try {
-        const cloudRow = db.prepare("SELECT valor FROM cloud_data WHERE empresa_id = ? AND clave = 'contactos'")
-          .get(ev.empresa_id);
-        if (cloudRow?.valor) {
-          const contactos = JSON.parse(cloudRow.valor);
-          const cliente = contactos.find(c =>
-            c.codigoCliente === ev.cliente_id || c.id === ev.cliente_id || c.nombre === ev.cliente_nombre
-          );
-          telefono = cliente?.tel || cliente?.telefono || null;
-        }
-      } catch (_) {}
-      if (!telefono) continue;
-      const phone = formatPhone(telefono);
-      if (!phone) continue;
-      const texto = [
-        `¡Hola${ev.cliente_nombre ? " " + ev.cliente_nombre : ""}! 👋`,
-        ev.empresa_nombre ? `Te escribimos de *${ev.empresa_nombre}*.` : "",
-        ev.descripcion || "Queríamos consultarte si necesitás algo o tenés alguna consulta.",
-        `Estamos a tu disposición. 😊`,
-      ].filter(Boolean).join("\n");
-      try {
-        await waClient.sendMessage(phone, texto);
-        db.prepare("UPDATE eventos SET completado = 1 WHERE id = ?").run(ev.id);
-        console.log(`[WhatsApp cron] ✓ Enviado a ${ev.cliente_nombre}`);
-      } catch (e) {
-        console.error(`[WhatsApp cron] ✗ Error:`, e.message);
-      }
-      await new Promise(r => setTimeout(r, 3000));
-    }
-  } catch (e) {
-    console.error("[WhatsApp cron] Error general:", e.message);
+  if(!waEmpresaId || process.env.WA_WEB_ENABLED!=='true' || process.env.WA_EMPRESA_ID===waEmpresaId && process.env.WA_CLOUD_TOKEN) return;
+  const date=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Costa_Rica'}).format(new Date());
+  const edb=getEmpresaDb(waEmpresaId);
+  const eventos=edb.prepare("SELECT * FROM eventos WHERE fecha=? AND tipo='seguimiento' AND completado=0").all(date);
+  const contactos=readERP(waEmpresaId,'contactos',[]);
+  for(const ev of eventos) {
+    const c=contactos.find(c=>c.id===ev.cliente_id || c.codigoCliente===ev.cliente_id);
+    const sender=formatPhone(c?.tel||c?.telefono);if(!sender)continue;
+    runtime.inbox.enqueue({empresaId:waEmpresaId,channel:'whatsapp-web',externalId:`recordatorio:${ev.id}:${date}`,sender,
+      payload:{reminder:ev.id,text:ev.descripcion||`Hola ${ev.cliente_nombre||''}, tenés un seguimiento programado con nosotros.`}});
   }
 }
 
 module.exports.enviarRecordatoriosHoy = enviarRecordatoriosHoy;
+
+runtime.register('whatsapp-web', {
+  available:r => process.env.WA_WEB_ENABLED==='true' && waReady && waEmpresaId===r.empresa_id && publicReply.active(r),
+  canSend:r=>publicReply.settings(r.empresa_id).modoRespuestas==='automatico',
+  prepare:async r => {
+    const c=publicReply.settings(r.empresa_id);
+    if(r.payload.reminder)return {text:r.payload.text,draft:c.modoRespuestas!=='automatico'};
+    if(r.payload.unsupported || c.modoRespuestas!=='automatico') return publicReply.prepare(r);
+    onboardearContacto(r.empresa_id,r.sender);
+    const text=await consultarRockyWA(r.payload.text,r.sender,r.empresa_id,`inbox:${r.id}`);
+    if(!text) throw new Error('Rocky no generó respuesta');
+    return {text};
+  },
+  send:async(r,text) => {
+    const key=`${r.sender}:${text}`;pendingSends.add(key);
+    try {
+      const sent=await waClient.sendMessage(r.sender,text);
+      if(!sent?.id?._serialized)throw new Error('Entrega no confirmada');
+      ownSends.add(sent.id._serialized);
+      if(ownSends.size>1000) ownSends.delete(ownSends.values().next().value);
+      if(r.payload.reminder)getEmpresaDb(r.empresa_id).prepare('UPDATE eventos SET completado=1 WHERE id=?').run(r.payload.reminder);
+      return sent.id._serialized;
+    } finally {pendingSends.delete(key);}
+  }
+});

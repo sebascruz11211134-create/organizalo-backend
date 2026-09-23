@@ -1,7 +1,7 @@
 {
   "name": "organizalo-backend",
   "version": "0.1.0",
-  "description": "Backend mínimo para conectar Organízalo.AI con la Facturación Electrónica del Ministerio de Hacienda de Costa Rica (v4.4).",
+  "description": "Backend m\u00ednimo para conectar Organ\u00edzalo.AI con la Facturaci\u00f3n Electr\u00f3nica del Ministerio de Hacienda de Costa Rica (v4.4).",
   "main": "src/index.js",
   "private": true,
   "engines": {
@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "smoke-test": "node scripts/smoke-test.js"
+    "smoke-test": "node scripts/smoke-test.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.30.1",
