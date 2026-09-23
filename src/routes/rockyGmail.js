@@ -7,10 +7,27 @@ const runtime=require('../services/rockyRuntime');
 const reply=require('../services/rockyReply');
 const router=express.Router();
 db.exec(`CREATE TABLE IF NOT EXISTS rocky_gmail (empresa_id TEXT PRIMARY KEY,email TEXT NOT NULL,secret TEXT NOT NULL,history_id TEXT,connected_at INTEGER,last_poll INTEGER,error TEXT);
-CREATE TABLE IF NOT EXISTS rocky_oauth_states (state TEXT PRIMARY KEY,empresa_id TEXT NOT NULL,user_id TEXT NOT NULL,expires INTEGER NOT NULL);`);
+CREATE TABLE IF NOT EXISTS rocky_oauth_states (state TEXT PRIMARY KEY,empresa_id TEXT NOT NULL,user_id TEXT NOT NULL,expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS rocky_oauth_used (state_hash TEXT PRIMARY KEY,expires INTEGER NOT NULL);`);
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS rocky_gmail_account ON rocky_gmail(email)');
 const callback=()=>`${config.publicUrl}/api/rocky/channels/gmail/callback`;
 function configured() {return !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && /^[a-f0-9]{64}$/i.test(process.env.ROCKY_ENCRYPTION_KEY||'') && process.env.ROCKY_GMAIL_ADDRESS);}
+function signState(payload) {
+  const body=Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature=crypto.createHmac('sha256',Buffer.from(process.env.ROCKY_ENCRYPTION_KEY,'hex')).update(body).digest('base64url');
+  return `${body}.${signature}`;
+}
+function verifyState(value) {
+  try {
+    const [body,signature,...extra]=String(value||'').split('.');
+    if(!body||!signature||extra.length) return null;
+    const expected=crypto.createHmac('sha256',Buffer.from(process.env.ROCKY_ENCRYPTION_KEY,'hex')).update(body).digest();
+    const received=Buffer.from(signature,'base64url');
+    if(received.length!==expected.length||!crypto.timingSafeEqual(received,expected)) return null;
+    const payload=JSON.parse(Buffer.from(body,'base64url').toString('utf8'));
+    return payload?.empresa_id&&payload?.user_id&&Number(payload.expires)>Date.now()?payload:null;
+  } catch { return null; }
+}
 function encrypt(value) {
   const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',Buffer.from(process.env.ROCKY_ENCRYPTION_KEY,'hex'),iv);
   const data=Buffer.concat([cipher.update(value,'utf8'),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),data]).toString('base64');
@@ -35,16 +52,24 @@ router.get('/status',admin,(req,res)=>{
 router.post('/connect',admin,(req,res)=>{
   if(!configured()) return res.status(503).json({error:'Falta configurar Google OAuth, dirección de Gmail y clave de cifrado en el servidor.'});
   db.prepare('DELETE FROM rocky_oauth_states WHERE expires<?').run(Date.now());
-  const state=crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO rocky_oauth_states VALUES(?,?,?,?)').run(state,req.jwtPayload.empresaId,req.jwtPayload.sub,Date.now()+600000);
+  const expires=Date.now()+600000;
+  const state=signState({empresa_id:req.jwtPayload.empresaId,user_id:req.jwtPayload.sub,expires,nonce:crypto.randomBytes(16).toString('hex')});
+  db.prepare('INSERT INTO rocky_oauth_states VALUES(?,?,?,?)').run(state,req.jwtPayload.empresaId,req.jwtPayload.sub,expires);
   const query=new URLSearchParams({client_id:process.env.GOOGLE_CLIENT_ID,redirect_uri:callback(),response_type:'code',access_type:'offline',prompt:'consent',state,login_hint:process.env.ROCKY_GMAIL_ADDRESS,scope:'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send'});
   res.json({url:`https://accounts.google.com/o/oauth2/v2/auth?${query}`});
 });
 router.get('/callback',async(req,res)=>{
-  const state=db.prepare('DELETE FROM rocky_oauth_states WHERE state=? AND expires>? RETURNING *').get(String(req.query.state||''),Date.now());
-  if(!state || !req.query.code) return res.status(400).send('Conexión cancelada o vencida. Volvé a conectar desde el ERP.');
+  const rawState=String(req.query.state||'');
+  const state=verifyState(rawState);
+  db.prepare('DELETE FROM rocky_oauth_used WHERE expires<?').run(Date.now());
+  const stateHash=crypto.createHash('sha256').update(rawState).digest('hex');
+  const fresh=state&&db.prepare('INSERT OR IGNORE INTO rocky_oauth_used VALUES(?,?)').run(stateHash,state.expires).changes===1;
+  // Best-effort cleanup. The signed state remains valid across restarts and
+  // deployments; the used-state table keeps the callback strictly one-use.
+  db.prepare('DELETE FROM rocky_oauth_states WHERE state=?').run(rawState);
+  if(!fresh || !req.query.code) return res.status(400).send('Conexión cancelada o vencida. Volvé a conectar desde el ERP.');
   const user=db.prepare('SELECT * FROM users WHERE id=? AND activo=1').get(state.user_id);
-  if(!user||user.empresa_id!==state.empresa_id||!['admin','superadmin','gerencia'].includes(user.rol)) return res.sendStatus(403);
+  if(!user||(user.empresa_id||user.id)!==state.empresa_id||!['admin','superadmin','gerencia'].includes(user.rol)) return res.sendStatus(403);
   try {
     const tokens=await tokenRequest({code:String(req.query.code),redirect_uri:callback(),grant_type:'authorization_code'});
     const profile=await gmail(tokens.access_token,'profile');
@@ -123,4 +148,4 @@ runtime.register('gmail',{
   }
 });
 function start() { const t=setInterval(()=>poll().catch(()=>{}),60000);t.unref();poll().catch(()=>{}); }
-module.exports={router,start,emailAddress,poll};
+module.exports={router,start,emailAddress,poll,signState,verifyState};
