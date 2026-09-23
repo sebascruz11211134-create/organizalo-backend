@@ -313,7 +313,7 @@ async function responderConIA({ empresaId, canal, texto, io, edb }) {
 // ── GET /api/chat/no-leidos — total de mensajes no leídos en todos los canales ─
 router.get("/no-leidos", requireJWT, (req, res) => {
   try {
-    const { userId, empresaId } = req.user;
+    const { sub: userId, empresaId } = req.jwtPayload;
     const edb = getEmpresaDb(empresaId);
     edb.prepare(`CREATE TABLE IF NOT EXISTS chat_leidos (
       id TEXT PRIMARY KEY, canal TEXT NOT NULL, user_id TEXT NOT NULL,
